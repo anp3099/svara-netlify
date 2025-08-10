@@ -1,20 +1,18 @@
-// src/lib/validateEnv.ts
-import { z } from "zod";
+// src/main.tsx
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App'
+import './index.css'
 
-// Add whatever VITE_* keys your app actually uses
-const EnvSchema = z.object({
-  VITE_BLINK_PROJECT_ID: z.string().min(1, "Missing VITE_BLINK_PROJECT_ID"),
-  // Optional examples:
-  VITE_API_BASE_URL: z.string().url().optional(),
-  VITE_STRIPE_PUBLISHABLE_KEY: z.string().optional(),
-});
+// Importing this runs the env validation at startup.
+// If a required VITE_* var is missing, it will throw with a clear message.
+import env from './lib/validateEnv'
 
-export type Env = z.infer<typeof EnvSchema>;
+// (Optional) confirm it's loaded — you can delete this line.
+console.debug('[env OK]', env.VITE_BLINK_PROJECT_ID)
 
-const env: Env = EnvSchema.parse({
-  VITE_BLINK_PROJECT_ID: import.meta.env.VITE_BLINK_PROJECT_ID,
-  VITE_API_BASE_URL: import.meta.env.VITE_API_BASE_URL,
-  VITE_STRIPE_PUBLISHABLE_KEY: import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY,
-});
-
-export default env;
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+)
