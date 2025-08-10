@@ -2,37 +2,37 @@ import type { Handler } from '@netlify/functions'
 import Stripe from 'stripe'
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, { apiVersion: '2024-06-20' })
-const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET as string
 
 export const handler: Handler = async (event) => {
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, body: 'Method Not Allowed' }
   }
-  if (!webhookSecret) {
-    return { statusCode: 500, body: 'Missing STRIPE_WEBHOOK_SECRET' }
-  }
-
-  const sig = event.headers['stripe-signature'] || event.headers['Stripe-Signature']
 
   try {
-    const payload = event.body || ''
-    const stripeEvent = stripe.webhooks.constructEvent(payload, sig as string, webhookSecret)
+    const body = event.body ? JSON.parse(event.body) : {}
+    const { priceId, customerEmail, trialPeriodDays, successUrl, cancelUrl } = body
 
-    switch (stripeEvent.type) {
-      case 'checkout.session.completed':
-      case 'invoice.payment_succeeded':
-      case 'invoice.payment_failed':
-      case 'customer.subscription.created':
-      case 'customer.subscription.updated':
-      case 'customer.subscription.deleted':
-        // TODO: persist subscription state in your DB / Blink backend
-        break
-      default:
+    if (!priceId) {
+      return { statusCode: 400, body: JSON.stringify({ error: 'missing_price_id' }) }
     }
 
-    return { statusCode: 200, body: JSON.stringify({ received: true }) }
-  } catch (err: any) {
-    console.error('Webhook signature verification failed.', err?.message || err)
-    return { statusCode: 400, body: 'Bad signature' }
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      customer_email: customerEmail,
+      allow_promotion_codes: true,
+      subscription_data: trialPeriodDays ? { trial_period_days: trialPeriodDays } : undefined,
+      success_url: successUrl ?? `${process.env.APP_URL}/dashboard?success=true`,
+      cancel_url:  cancelUrl  ?? `${process.env.APP_URL}/pricing`,
+    })
+
+    return {
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: session.id, url: session.url, status: session.status }),
+    }
+  } catch (err) {
+    console.error('checkout failed', err)
+    return { statusCode: 500, body: JSON.stringify({ error: 'checkout_failed' }) }
   }
 }
