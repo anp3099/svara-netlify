@@ -1,27 +1,23 @@
 [build]
-  publish = "dist"
   command = "npm run build"
+  publish  = "dist"
 
 [functions]
-  directory = "netlify/functions"
+  directory    = "netlify/functions"
   node_bundler = "esbuild"
 
 [build.environment]
   NODE_VERSION = "18"
 
-# SPA fallback for Vite
+# 1) API routes -> serverless functions (put this FIRST)
 [[redirects]]
-  from = "/*"
-  to = "/index.html"
+  from   = "/api/*"
+  to     = "/.netlify/functions/:splat"
   status = 200
+  force  = true
 
-# API routes -> serverless functions
+# 2) SPA fallback for Vite (put this AFTER the API rule)
 [[redirects]]
-  from = "/api/checkout"
-  to = "/.netlify/functions/checkout"
-  status = 200
-
-[[redirects]]
-  from = "/api/stripe-webhook"
-  to = "/.netlify/functions/stripe-webhook"
+  from   = "/*"
+  to     = "/index.html"
   status = 200
