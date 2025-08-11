@@ -1,35 +1,14 @@
-import React from 'react'
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom'
-import Home from './pages/Home'
-import { RobustAppLayout } from './components/layout/RobustAppLayout'
-import { RequireAuth } from './components/auth/RequireAuth'
-import { Toaster } from './components/ui/toaster'
+// src/App.tsx
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import Home from './pages/Home';
 
-function App() {
-  console.log('🔥 App component is rendering!')
-  
+export default function App() {
   return (
     <Router>
-      <div className="min-h-screen">
-        <Routes>
-          {/* Public marketing website */}
-          <Route path="/" element={<Home />} />
-          
-          {/* Protected app routes */}
-          <Route path="/app" element={
-            <RequireAuth>
-              <RobustAppLayout />
-            </RequireAuth>
-          } />
-          
-          {/* Legacy route redirects */}
-          <Route path="/dashboard" element={<Navigate to="/app" replace />} />
-        </Routes>
-        
-        <Toaster />
-      </div>
+      <Routes>
+        <Route path="/" element={<Home />} />
+      </Routes>
     </Router>
-  )
+  );
 }
-
-export default App
