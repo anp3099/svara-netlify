@@ -7,7 +7,7 @@
   node_bundler = "esbuild"
 
 [build.environment]
-  NODE_VERSION = "18"
+  NODE_VERSION = "20.18.1"
 
 # 1) API routes -> serverless functions (put this FIRST)
 [[redirects]]
