@@ -1,14 +1,21 @@
-import React from 'react';
-import ReactDOM from 'react-dom/client';
-import App from './App';
-import './index.css';
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App'
+import './index.css'
+import { validateClientEnv } from './lib/validateEnv'
 
-import { validateClientEnv } from './lib/validateEnv';
+validateClientEnv()
 
-validateClientEnv();
+// Ensure root element takes full viewport
+const rootElement = document.getElementById('root')!
+rootElement.style.width = '100%'
+rootElement.style.height = '100%'
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+ReactDOM.createRoot(rootElement).render(
   <React.StrictMode>
     <App />
-  </React.StrictMode>,
-);
+  </React.StrictMode>
+)
+
+// Expose smoke test route in dev only (will be compiled out in production unless route added)
+// The SmokeTest page is imported lazily via routing where needed.
