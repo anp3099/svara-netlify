@@ -9,7 +9,7 @@
 [build.environment]
   NODE_VERSION = "22.12.0"
 
-# API first
+# API -> serverless functions
 [[redirects]]
   from   = "/api/*"
   to     = "/.netlify/functions/:splat"
