@@ -1,7 +1,8 @@
 // netlify/functions/cb-webhook.ts
+
 export const config = { path: "/api/cb-webhook" };
 
-// ----- Types ----- //
+/* ---------------------- Types ---------------------- */
 type CBLead = {
   full_name?: string;
   first_name?: string;
@@ -14,10 +15,17 @@ type CBLead = {
   location?: string;
 };
 
-// ----- Helpers ----- //
+/* ---------------------- Utils ---------------------- */
 const ok = (d: any, s = 200) =>
-  new Response(JSON.stringify(d), { status: s, headers: { "content-type": "application/json" } });
+  new Response(JSON.stringify(d), {
+    status: s,
+    headers: { "content-type": "application/json" },
+  });
+
 const bad = (m: string, s = 400) => ok({ error: m }, s);
+
+const env = (k: string, fallback?: string) =>
+  (process.env[k] ?? fallback ?? "").toString();
 
 async function getStore(name: string) {
   const mod = await import("@netlify/blobs");
@@ -37,7 +45,9 @@ function normEmail(e?: string | null) {
 }
 
 async function hunterVerify(email: string, apiKey: string) {
-  const url = `https://api.hunter.io/v2/email-verifier?email=${encodeURIComponent(email)}&api_key=${apiKey}`;
+  const url = `https://api.hunter.io/v2/email-verifier?email=${encodeURIComponent(
+    email
+  )}&api_key=${apiKey}`;
   const r = await fetch(url, { headers: { accept: "application/json" } });
   if (!r.ok) return null;
   const j = await r.json();
@@ -45,7 +55,9 @@ async function hunterVerify(email: string, apiKey: string) {
 }
 
 async function hunterFind(full: string, domain: string, apiKey: string) {
-  const url = `https://api.hunter.io/v2/email-finder?full_name=${encodeURIComponent(full)}&domain=${encodeURIComponent(domain)}&api_key=${apiKey}`;
+  const url = `https://api.hunter.io/v2/email-finder?full_name=${encodeURIComponent(
+    full
+  )}&domain=${encodeURIComponent(domain)}&api_key=${apiKey}`;
   const r = await fetch(url, { headers: { accept: "application/json" } });
   if (!r.ok) return null;
   const j = await r.json();
@@ -64,18 +76,19 @@ function scoreLead(l: any) {
   return Math.min(100, s);
 }
 
-// ----- Counters ----- //
+/* -------------------- Counters --------------------- */
 async function getCounters() {
   const store = await getStore("leads-counters");
   const raw = await store.get("counters");
   return raw ? JSON.parse(raw) : null;
 }
+
 async function setCounters(data: any) {
   const store = await getStore("leads-counters");
   await store.set("counters", JSON.stringify(data));
 }
 
-// ----- Handler ----- //
+/* --------------------- Handler --------------------- */
 export default async (req: Request) => {
   if (req.method !== "POST") return bad("POST only", 405);
 
@@ -83,71 +96,115 @@ export default async (req: Request) => {
   const headerSecret = req.headers.get("x-webhook-secret") || "";
   const url = new URL(req.url);
   const querySecret = url.searchParams.get("secret") || "";
-  const secret = Deno.env.get("LEADS_WEBHOOK_SECRET") || "";
-  if (secret && headerSecret !== secret && querySecret !== secret) return bad("Unauthorized", 401);
+  const secret = env("LEADS_WEBHOOK_SECRET", "");
+  if (secret && headerSecret !== secret && querySecret !== secret) {
+    return bad("Unauthorized", 401);
+  }
 
-  // Optional source labelling: /api/cb-webhook?source=enrichment or extractor etc.
+  // Optional source label (e.g., ?source=enrichment)
   const cbSource = url.searchParams.get("source") || "conversion_blitz";
 
+  // Parse JSON body safely
   let body: any;
-  try { body = await req.json(); } catch { return bad("Invalid JSON"); }
+  try {
+    body = await req.json();
+  } catch (e) {
+    console.error("Invalid JSON body", e);
+    return bad("Invalid JSON");
+  }
 
   const leads: CBLead[] = Array.isArray(body)
     ? body
-    : Array.isArray(body?.leads) ? body.leads
+    : Array.isArray(body?.leads)
+    ? body.leads
     : [body];
 
-  const DAILY_CAP = Number(Deno.env.get("DAILY_CAP") || 70);
-  const MONTHLY_CAP = Number(Deno.env.get("MONTHLY_CAP") || 2000);
-  const HUNTER = Deno.env.get("HUNTER_API_KEY");
-  const MIN_SCORE = Number(Deno.env.get("HUNTER_MIN_SCORE") || 80);
+  // Env config
+  const DAILY_CAP = Number(env("DAILY_CAP", "70"));
+  const MONTHLY_CAP = Number(env("MONTHLY_CAP", "2000"));
+  const HUNTER = env("HUNTER_API_KEY", "");
+  const MIN_SCORE = Number(env("HUNTER_MIN_SCORE", "80"));
 
-  // counters
+  // Counters
   const counters = (await getCounters()) || {};
   const { day, month } = todayKeys();
-  if (counters.date !== day) counters.dayCount = 0, counters.date = day;
-  if (counters.month !== month) counters.monthCount = 0, counters.month = month;
+  if (counters.date !== day) {
+    counters.dayCount = 0;
+    counters.date = day;
+  }
+  if (counters.month !== month) {
+    counters.monthCount = 0;
+    counters.month = month;
+  }
 
-  const leadsStore = await getStore("leads");        // accepted
-  const queueStore = await getStore("leads-queue");  // queued for later
-  const dedupeStore = await getStore("leads-dedupe");// seen keys
+  const leadsStore = await getStore("leads"); // accepted
+  const queueStore = await getStore("leads-queue"); // queued for later
+  const dedupeStore = await getStore("leads-dedupe"); // seen keys
 
-  let accepted = 0, queued = 0, duplicates = 0, rejected = 0;
+  let accepted = 0,
+    queued = 0,
+    duplicates = 0,
+    rejected = 0;
 
   for (const raw of leads) {
-    const full = raw.full_name || `${raw.first_name ?? ""} ${raw.last_name ?? ""}`.trim();
+    const full =
+      raw.full_name ||
+      `${raw.first_name ?? ""} ${raw.last_name ?? ""}`.trim();
     const domain = raw.domain?.trim();
     let email = normEmail(raw.email);
 
     // dedupe key (prefer email; fallback to domain+full_name)
-    const dedupeKey = email || (domain && full ? `${domain}::${full.toLowerCase()}` : undefined);
-    if (!dedupeKey) { rejected++; continue; }
-    if (await dedupeStore.get(dedupeKey)) { duplicates++; continue; }
+    const dedupeKey =
+      email || (domain && full ? `${domain}::${full.toLowerCase()}` : undefined);
+    if (!dedupeKey) {
+      rejected++;
+      continue;
+    }
+    if (await dedupeStore.get(dedupeKey)) {
+      duplicates++;
+      continue;
+    }
 
     // enrich email if missing
     if (!email && HUNTER && domain && full) {
-      try { email = normEmail(await hunterFind(full, domain, HUNTER)); } catch {}
+      try {
+        email = normEmail(await hunterFind(full, domain, HUNTER));
+      } catch (e) {
+        console.error("hunterFind error", e);
+      }
     }
-    if (!email) { rejected++; continue; }
+    if (!email) {
+      rejected++;
+      continue;
+    }
 
     // verify
     let verification: any = null;
     if (HUNTER) {
-      try { verification = await hunterVerify(email, HUNTER); } catch {}
+      try {
+        verification = await hunterVerify(email, HUNTER);
+      } catch (e) {
+        console.error("hunterVerify error", e);
+      }
       const score = Number(verification?.score ?? 0);
-      if (score && score < MIN_SCORE) { rejected++; continue; }
+      if (score && score < MIN_SCORE) {
+        rejected++;
+        // still mark dedupe so we don't keep retrying same bad email
+        await dedupeStore.set(dedupeKey, "1");
+        continue;
+      }
     }
 
-    const finalLead = {
-      source: cbSource,                // label per CB module
+    const finalLead: Record<string, any> = {
+      source: cbSource, // label per CB module
       captured_at: new Date().toISOString(),
       ...raw,
       full_name: full || undefined,
       email,
       verification,
-      status: "ready"
+      status: "ready",
     };
-    finalLead["score"] = scoreLead(finalLead);
+    finalLead.score = scoreLead(finalLead);
 
     // caps
     if (counters.dayCount >= DAILY_CAP || counters.monthCount >= MONTHLY_CAP) {
@@ -160,14 +217,32 @@ export default async (req: Request) => {
     // accept
     await leadsStore.set(`cb:${email}`, JSON.stringify(finalLead));
     await dedupeStore.set(dedupeKey, "1");
-    counters.dayCount++; counters.monthCount++;
+    counters.dayCount++;
+    counters.monthCount++;
     accepted++;
   }
 
   await setCounters(counters);
 
+  console.log(
+    JSON.stringify({
+      received: leads.length,
+      accepted,
+      queued,
+      duplicates,
+      rejected,
+      dayCount: counters.dayCount,
+      monthCount: counters.monthCount,
+    })
+  );
+
   return ok({
-    received: leads.length, accepted, queued, duplicates, rejected,
-    dayCount: counters.dayCount, monthCount: counters.monthCount
+    received: leads.length,
+    accepted,
+    queued,
+    duplicates,
+    rejected,
+    dayCount: counters.dayCount,
+    monthCount: counters.monthCount,
   });
 };
