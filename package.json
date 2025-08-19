@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@blinkdotnew/sdk": "^0.17.3",
+    "@netlify/blobs": "^8.0.0",
     "@dnd-kit/core": "^6.3.1",
     "@hookform/resolvers": "^5.1.1",
 
