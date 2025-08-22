@@ -110,4 +110,18 @@ Return JSON with "steps":[{"type":"email","subject":"...","body":"..."},{"type":
   }
 }
 
-export const campaignsService = new CampaignsService()
+export const campaignsService = {
+  async listCampaigns() {
+    // adjust to your schema; this is an example
+    return await blink.db.campaigns.list({ orderBy: { createdAt: "desc" }, limit: 100 });
+  },
+
+  async addLeadsToCampaign(campaignId: string, leads: any[]) {
+    // upsert leads, then attach to campaign (example schema)
+    for (const l of leads) {
+      await blink.db.leads.upsert({ id: l.id }, l);
+      await blink.db.campaignLeads.create({ campaignId, leadId: l.id });
+    }
+    return { ok: true, count: leads.length };
+  },
+};
