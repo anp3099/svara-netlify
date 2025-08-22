@@ -1,5 +1,8 @@
 import React, { useState, useEffect } from 'react'
-import { Search, Target, Users, Building2, MapPin, DollarSign, Zap, Plus, Database, CreditCard, AlertTriangle } from 'lucide-react'
+import {
+  Search, Target, Users, Building2, MapPin, DollarSign, Zap, Plus, Database,
+  CreditCard, AlertTriangle, Badge as LucideBadgeIcon
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -12,11 +15,17 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { blink } from '@/blink/client'
 import { safeCapitalize } from '@/lib/utils'
 import { leadGenerationService, type LeadCriteria } from '@/services/leadGeneration'
-import { realLeadDatabase } from '@/services/realLeadDatabase'
 import { quotaTracker, UserQuota } from '@/services/quotaTracker'
 import { planRestrictionService } from '@/services/planRestrictions'
 import { QuotaLimitModal } from '@/components/dashboard/QuotaLimitModal'
 import { UsageDashboard } from '@/components/dashboard/UsageDashboard'
+
+/**
+ * DEV BYPASS:
+ * Set NEXT_PUBLIC_BYPASS_QUOTA=1 to skip plan/quota checks so you can test generation.
+ * Remove/disable for production builds.
+ */
+const BYPASS = process.env.NEXT_PUBLIC_BYPASS_QUOTA === '1'
 
 interface LeadGenerationCriteria {
   industry: string
@@ -74,7 +83,7 @@ export default function LeadGeneration() {
   const [showUsageDashboard, setShowUsageDashboard] = useState(false)
 
   const industries = [
-    'Technology', 'Healthcare', 'Financial Services', 'Manufacturing', 
+    'Technology', 'Healthcare', 'Financial Services', 'Manufacturing',
     'Retail & E-commerce', 'Marketing & Advertising', 'Professional Services', 'Education'
   ]
 
@@ -87,7 +96,7 @@ export default function LeadGeneration() {
   ]
 
   const jobTitles = [
-    'CEO', 'CTO', 'VP Sales', 'VP Marketing', 'CMO', 'COO', 'Director', 
+    'CEO', 'CTO', 'VP Sales', 'VP Marketing', 'CMO', 'COO', 'Director',
     'Manager', 'Head of', 'Principal', 'Senior'
   ]
 
@@ -101,33 +110,35 @@ export default function LeadGeneration() {
         return
       }
 
-      // Check plan restrictions and quota before generating leads
+      // Credits needed per generation run
       const creditsNeeded = 50
       console.log('Checking restrictions for user:', user.id, 'credits needed:', creditsNeeded)
-      
-      // Check plan restrictions first
-      const planCheck = await planRestrictionService.canAccessLeads(user.id, creditsNeeded)
-      if (!planCheck.allowed) {
-        alert(planCheck.message || 'Plan limit exceeded for lead generation.')
-        setIsGenerating(false)
-        return
+
+      if (BYPASS) {
+        console.warn('[DEV] BYPASS enabled: skipping plan/quota checks')
+      } else {
+        // 1) Plan restrictions
+        const planCheck = await planRestrictionService.canAccessLeads(user.id, creditsNeeded)
+        if (!planCheck.allowed) {
+          alert(planCheck.message || 'Plan limit exceeded for lead generation.')
+          setIsGenerating(false)
+          return
+        }
+
+        // 2) Quota
+        const quotaCheck = await quotaTracker.checkQuotaAvailable(user.id, creditsNeeded)
+        console.log('Quota check result:', quotaCheck)
+        if (!quotaCheck.allowed) {
+          const isDailyLimit = quotaCheck.reason?.includes('Daily')
+          setQuotaLimitType(isDailyLimit ? 'daily' : 'monthly')
+          setShowQuotaModal(true)
+          setIsGenerating(false)
+          return
+        }
       }
-      
-      // Check quota
-      const quotaCheck = await quotaTracker.checkQuotaAvailable(user.id, creditsNeeded)
-      console.log('Quota check result:', quotaCheck)
-      
-      if (!quotaCheck.allowed) {
-        // Determine if it's daily or monthly limit
-        const isDailyLimit = quotaCheck.reason?.includes('Daily')
-        setQuotaLimitType(isDailyLimit ? 'daily' : 'monthly')
-        setShowQuotaModal(true)
-        setIsGenerating(false)
-        return
-      }
-      
-      // Use the enhanced lead generation service with Hunter.io integration
-      const searchCriteria = {
+
+      // Build search criteria for the service
+      const searchCriteria: LeadCriteria = {
         industry: criteria.industry !== 'any' ? criteria.industry : undefined,
         company_size: criteria.company_size !== 'any' ? criteria.company_size : undefined,
         revenue_range: criteria.revenue_range !== 'any' ? criteria.revenue_range : undefined,
@@ -142,9 +153,9 @@ export default function LeadGeneration() {
       console.log('Starting lead generation with criteria:', searchCriteria)
       const result = await leadGenerationService.generateLeads(searchCriteria, user.id)
       console.log('Lead generation result:', result)
-      
-      // Convert leads to component format
-      const convertedLeads: GeneratedLead[] = result.leads.map(lead => ({
+
+      // Convert response to UI format
+      const convertedLeads: GeneratedLead[] = (result.leads || []).map((lead: any) => ({
         id: lead.id,
         company_name: lead.company_name,
         industry: lead.industry,
@@ -158,29 +169,28 @@ export default function LeadGeneration() {
         lead_score: lead.lead_score,
         match_reason: lead.match_reason
       }))
-      
+
       setGeneratedLeads(convertedLeads)
       setGenerationStats({
-        total_found: result.total_found,
-        generation_time: result.generation_time,
-        sources_used: result.sources_used,
-        google_maps_count: result.google_maps_count,
-        traditional_count: result.traditional_count,
-        hunter_io_count: result.hunter_io_count
+        total_found: result.total_found ?? convertedLeads.length,
+        generation_time: result.generation_time ?? 0,
+        sources_used: result.sources_used ?? [],
+        google_maps_count: result.google_maps_count ?? 0,
+        traditional_count: result.traditional_count ?? 0,
+        hunter_io_count: result.hunter_io_count ?? 0
       })
-      
-      // Show success message with source breakdown
-      const sourceMessage = result.sources_used.join(', ')
+
+      const sources = (result.sources_used ?? []).join(', ') || 'our data sources'
       const hunterCount = result.hunter_io_count || 0
-      const successMessage = hunterCount > 0 
-        ? `Successfully generated ${convertedLeads.length} leads! Found ${hunterCount} verified contacts from Hunter.io and ${result.traditional_count} from our database. Sources: ${sourceMessage}`
-        : `Successfully generated ${convertedLeads.length} leads from ${sourceMessage}!`
-      
+      const successMessage = hunterCount > 0
+        ? `Successfully generated ${convertedLeads.length} leads! Found ${hunterCount} verified contacts from Hunter.io and ${result.traditional_count || 0} from our database. Sources: ${sources}`
+        : `Successfully generated ${convertedLeads.length} leads from ${sources}!`
+
       alert(successMessage)
-      
-      // Refresh quota after successful generation
+
+      // Refresh quota after a successful generation (no-op if BYPASS)
       await loadUserQuota()
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to generate leads:', error)
       alert(`Failed to generate leads: ${error?.message || 'Unknown error'}. Please try again.`)
     } finally {
@@ -199,7 +209,7 @@ export default function LeadGeneration() {
   const addToDatabase = async () => {
     try {
       const leadsToAdd = generatedLeads.filter(lead => selectedLeads.includes(lead.id))
-      
+
       // Convert to service format and save
       const serviceLeads = leadsToAdd.map(lead => ({
         id: lead.id,
@@ -251,7 +261,7 @@ export default function LeadGeneration() {
     }
   }
 
-  // Load total leads count on component mount
+  // Load total leads count on mount
   useEffect(() => {
     const loadTotalLeads = async () => {
       try {
@@ -276,19 +286,23 @@ export default function LeadGeneration() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Lead Generation</h1>
-          <p className="text-gray-600 mt-1">Generate targeted leads using AI, Hunter.io, People Data Labs, and real-time Google Maps data</p>
+          <p className="text-gray-600 mt-1">
+            Generate targeted leads using AI, Hunter.io, People Data Labs, and real-time Google Maps data
+          </p>
           {totalLeadsAvailable > 0 && (
             <div className="flex items-center mt-2 text-sm text-indigo-600">
               <Database className="w-4 h-4 mr-1" />
               <span className="font-medium">{totalLeadsAvailable.toLocaleString()} leads available</span>
             </div>
           )}
+          {BYPASS && (
+            <div className="mt-2">
+              <Badge className="bg-orange-100 text-orange-800">DEV BYPASS: quota & plan checks disabled</Badge>
+            </div>
+          )}
         </div>
         <div className="flex items-center space-x-3">
-          <Button 
-            variant="outline"
-            onClick={() => setShowUsageDashboard(!showUsageDashboard)}
-          >
+          <Button variant="outline" onClick={() => setShowUsageDashboard(!showUsageDashboard)}>
             View Usage Stats
           </Button>
           {selectedLeads.length > 0 && (
@@ -297,8 +311,8 @@ export default function LeadGeneration() {
                 <Plus className="w-4 h-4 mr-2" />
                 Add to Database ({selectedLeads.length})
               </Button>
-              <Button 
-                onClick={() => window.location.href = '/billing'}
+              <Button
+                onClick={() => (window.location.href = '/billing')}
                 className="bg-green-600 hover:bg-green-700"
               >
                 <CreditCard className="w-4 h-4 mr-2" />
@@ -311,21 +325,27 @@ export default function LeadGeneration() {
 
       {/* Quota Status Alert */}
       {quota && (
-        <Alert className={`${
-          quota.dailyUsage / quota.dailyLimit >= 0.8 || quota.monthlyUsage / quota.monthlyLimit >= 0.8
-            ? 'border-orange-200 bg-orange-50'
-            : 'border-blue-200 bg-blue-50'
-        }`}>
-          <AlertTriangle className={`h-4 w-4 ${
+        <Alert
+          className={`${
             quota.dailyUsage / quota.dailyLimit >= 0.8 || quota.monthlyUsage / quota.monthlyLimit >= 0.8
-              ? 'text-orange-600'
-              : 'text-blue-600'
-          }`} />
-          <AlertDescription className={
-            quota.dailyUsage / quota.dailyLimit >= 0.8 || quota.monthlyUsage / quota.monthlyLimit >= 0.8
-              ? 'text-orange-800'
-              : 'text-blue-800'
-          }>
+              ? 'border-orange-200 bg-orange-50'
+              : 'border-blue-200 bg-blue-50'
+          }`}
+        >
+          <AlertTriangle
+            className={`h-4 w-4 ${
+              quota.dailyUsage / quota.dailyLimit >= 0.8 || quota.monthlyUsage / quota.monthlyLimit >= 0.8
+                ? 'text-orange-600'
+                : 'text-blue-600'
+            }`}
+          />
+          <AlertDescription
+            className={
+              quota.dailyUsage / quota.dailyLimit >= 0.8 || quota.monthlyUsage / quota.monthlyLimit >= 0.8
+                ? 'text-orange-800'
+                : 'text-blue-800'
+            }
+          >
             <div className="flex items-center justify-between">
               <div>
                 <strong>Current Plan: {safeCapitalize(quota?.planType, 'Unknown')}</strong>
@@ -335,11 +355,7 @@ export default function LeadGeneration() {
                 Monthly: {quota.monthlyUsage}/{quota.monthlyLimit} leads
               </div>
               {(quota.dailyUsage / quota.dailyLimit >= 0.8 || quota.monthlyUsage / quota.monthlyLimit >= 0.8) && (
-                <Button 
-                  variant="outline" 
-                  size="sm"
-                  onClick={() => window.location.href = '/billing'}
-                >
+                <Button variant="outline" size="sm" onClick={() => (window.location.href = '/billing')}>
                   Upgrade Plan
                 </Button>
               )}
@@ -353,12 +369,10 @@ export default function LeadGeneration() {
         <Card>
           <CardHeader>
             <CardTitle>Usage Dashboard</CardTitle>
-            <CardDescription>
-              Monitor your lead generation quotas and API usage
-            </CardDescription>
+            <CardDescription>Monitor your lead generation quotas and API usage</CardDescription>
           </CardHeader>
           <CardContent>
-            <UsageDashboard onUpgradeClick={() => window.location.href = '/billing'} />
+            <UsageDashboard onUpgradeClick={() => (window.location.href = '/billing')} />
           </CardContent>
         </Card>
       )}
@@ -370,15 +384,16 @@ export default function LeadGeneration() {
             <Target className="w-5 h-5" />
             <span>Lead Generation Criteria</span>
           </CardTitle>
-          <CardDescription>
-            Define your ideal customer profile to generate high-quality leads
-          </CardDescription>
+          <CardDescription>Define your ideal customer profile to generate high-quality leads</CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             <div className="space-y-2">
               <Label htmlFor="industry">Industry</Label>
-              <Select value={criteria.industry} onValueChange={(value) => setCriteria(prev => ({ ...prev, industry: value }))}>
+              <Select
+                value={criteria.industry}
+                onValueChange={(value) => setCriteria((prev) => ({ ...prev, industry: value }))}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="Select industry" />
                 </SelectTrigger>
@@ -395,7 +410,10 @@ export default function LeadGeneration() {
 
             <div className="space-y-2">
               <Label htmlFor="company-size">Company Size</Label>
-              <Select value={criteria.company_size} onValueChange={(value) => setCriteria(prev => ({ ...prev, company_size: value }))}>
+              <Select
+                value={criteria.company_size}
+                onValueChange={(value) => setCriteria((prev) => ({ ...prev, company_size: value }))}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="Select company size" />
                 </SelectTrigger>
@@ -412,7 +430,10 @@ export default function LeadGeneration() {
 
             <div className="space-y-2">
               <Label htmlFor="revenue">Revenue Range</Label>
-              <Select value={criteria.revenue_range} onValueChange={(value) => setCriteria(prev => ({ ...prev, revenue_range: value }))}>
+              <Select
+                value={criteria.revenue_range}
+                onValueChange={(value) => setCriteria((prev) => ({ ...prev, revenue_range: value }))}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="Select revenue range" />
                 </SelectTrigger>
@@ -433,7 +454,7 @@ export default function LeadGeneration() {
                 id="location"
                 placeholder="e.g., San Francisco, CA"
                 value={criteria.location}
-                onChange={(e) => setCriteria(prev => ({ ...prev, location: e.target.value }))}
+                onChange={(e) => setCriteria((prev) => ({ ...prev, location: e.target.value }))}
               />
             </div>
 
@@ -443,26 +464,32 @@ export default function LeadGeneration() {
                   <Checkbox
                     id="include-hunter-io"
                     checked={criteria.include_hunter_io}
-                    onCheckedChange={(checked) => setCriteria(prev => ({ ...prev, include_hunter_io: !!checked }))}
+                    onCheckedChange={(checked) => setCriteria((prev) => ({ ...prev, include_hunter_io: !!checked }))}
                   />
-                  <Label htmlFor="include-hunter-io" className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
+                  <Label
+                    htmlFor="include-hunter-io"
+                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                  >
                     Include Hunter.io leads
                   </Label>
                   <Badge className="bg-green-100 text-green-800 text-xs">NEW</Badge>
                 </div>
                 <p className="text-xs text-gray-500">
-                  Get verified email addresses and contact details from Hunter.io's professional database
+                  Get verified email addresses and contact details from Hunter.io&apos;s professional database
                 </p>
               </div>
-              
+
               <div className="space-y-2">
                 <div className="flex items-center space-x-2">
                   <Checkbox
                     id="include-google-maps"
                     checked={criteria.include_google_maps}
-                    onCheckedChange={(checked) => setCriteria(prev => ({ ...prev, include_google_maps: !!checked }))}
+                    onCheckedChange={(checked) => setCriteria((prev) => ({ ...prev, include_google_maps: !!checked }))}
                   />
-                  <Label htmlFor="include-google-maps" className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
+                  <Label
+                    htmlFor="include-google-maps"
+                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                  >
                     Include Google Maps leads
                   </Label>
                 </div>
@@ -476,7 +503,7 @@ export default function LeadGeneration() {
               <Label>Minimum Lead Score: {criteria.lead_score_min}</Label>
               <Slider
                 value={[criteria.lead_score_min]}
-                onValueChange={(value) => setCriteria(prev => ({ ...prev, lead_score_min: value[0] }))}
+                onValueChange={(value) => setCriteria((prev) => ({ ...prev, lead_score_min: value[0] }))}
                 max={100}
                 min={0}
                 step={5}
@@ -486,8 +513,8 @@ export default function LeadGeneration() {
           </div>
 
           <div className="flex justify-center">
-            <Button 
-              onClick={generateLeads} 
+            <Button
+              onClick={generateLeads}
               disabled={isGenerating}
               className="bg-indigo-600 hover:bg-indigo-700"
               size="lg"
@@ -517,9 +544,7 @@ export default function LeadGeneration() {
                 <Users className="w-5 h-5" />
                 <span>Generated Leads ({generatedLeads.length})</span>
               </div>
-              <div className="text-sm text-gray-600">
-                {selectedLeads.length} selected
-              </div>
+              <div className="text-sm text-gray-600">{selectedLeads.length} selected</div>
             </CardTitle>
             <CardDescription>
               AI-generated leads matching your criteria from Hunter.io, People Data Labs, and real-time Google Maps data
@@ -528,9 +553,9 @@ export default function LeadGeneration() {
                   <span>✓ Generated in {(generationStats.generation_time / 1000).toFixed(1)}s</span>
                   <span>✓ {generationStats.total_found} high-quality matches found</span>
                   {generationStats.sources_used && <span>✓ Sources: {generationStats.sources_used.join(', ')}</span>}
-                  {generationStats.hunter_io_count && <span>✓ Hunter.io: {generationStats.hunter_io_count} verified contacts</span>}
-                  {generationStats.google_maps_count && <span>✓ Google Maps: {generationStats.google_maps_count}</span>}
-                  {generationStats.traditional_count && <span>✓ Database: {generationStats.traditional_count}</span>}
+                  {generationStats.hunter_io_count ? <span>✓ Hunter.io: {generationStats.hunter_io_count} verified contacts</span> : null}
+                  {generationStats.google_maps_count ? <span>✓ Google Maps: {generationStats.google_maps_count}</span> : null}
+                  {generationStats.traditional_count ? <span>✓ Database: {generationStats.traditional_count}</span> : null}
                 </div>
               )}
             </CardDescription>
@@ -538,8 +563,8 @@ export default function LeadGeneration() {
           <CardContent>
             <div className="space-y-4">
               {generatedLeads.map((lead) => (
-                <div 
-                  key={lead.id} 
+                <div
+                  key={lead.id}
                   className={`border rounded-lg p-4 cursor-pointer transition-all ${
                     selectedLeads.includes(lead.id) ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 hover:border-gray-300'
                   }`}
@@ -553,8 +578,11 @@ export default function LeadGeneration() {
                         </div>
                         <div className="flex-1">
                           <div className="flex items-center space-x-2">
-                            <a 
-                              href={`https://${lead.company_name.toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '')}.com`}
+                            <a
+                              href={`https://${lead.company_name
+                                .toLowerCase()
+                                .replace(/\s+/g, '')
+                                .replace(/[^a-z0-9]/g, '')}.com`}
                               target="_blank"
                               rel="noopener noreferrer"
                               className="font-semibold text-indigo-600 hover:text-indigo-800 hover:underline"
@@ -569,7 +597,7 @@ export default function LeadGeneration() {
                           <p className="text-sm text-gray-600">{lead.industry}</p>
                         </div>
                       </div>
-                      
+
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
                         <div>
                           <h4 className="font-medium text-gray-900">{lead.contact_name}</h4>
@@ -591,14 +619,14 @@ export default function LeadGeneration() {
                           </div>
                         </div>
                       </div>
-                      
+
                       <div className="bg-gray-50 rounded-md p-3 mb-3">
                         <p className="text-sm text-gray-700">
                           <strong>Match Reason:</strong> {lead.match_reason}
                         </p>
                       </div>
                     </div>
-                    
+
                     <div className="flex flex-col items-end space-y-2">
                       <div className="flex items-center space-x-2">
                         <span className="text-sm font-medium">{lead.lead_score}</span>
@@ -624,7 +652,7 @@ export default function LeadGeneration() {
         open={showQuotaModal}
         onOpenChange={setShowQuotaModal}
         quota={quota}
-        onUpgrade={() => window.location.href = '/billing'}
+        onUpgrade={() => (window.location.href = '/billing')}
         limitType={quotaLimitType}
       />
     </div>
