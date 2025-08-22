@@ -25,19 +25,14 @@ import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 
-// OPTIONAL: use your campaigns service if present
-// Safe to keep — code checks for existence at runtime.
-let campaignsService: any = undefined;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  campaignsService = require("@/services/campaigns");
-  campaignsService = campaignsService?.campaignsService || campaignsService?.default || campaignsService;
-} catch { /* optional */ }
+// If you have a campaigns service, import it directly.
+// It should expose: listCampaigns(), addLeadsToCampaign(campaignId, leads), createCampaign(name)
+import { campaignsService } from "@/services/campaigns"; // keep if file exists; otherwise REST fallbacks below will be used safely.
 
-/** UI Lead shape */
+/** ---- types ---- */
 type Lead = {
   id: string;
   companyName: string;
@@ -65,7 +60,7 @@ type Lead = {
 
 type CampaignLite = { id: string; name: string };
 
-/** Fallback sample list used ONLY if the API returns nothing */
+/** fallback demo data (only used if API returns nothing) */
 const sampleLeads: Lead[] = [
   {
     id: "demo_1",
@@ -101,7 +96,7 @@ const sampleLeads: Lead[] = [
   },
 ];
 
-/** ---- helpers to map your API objects into UI leads ---- */
+/** ---- mapping helpers ---- */
 const toStr = (v: any) => (v === undefined || v === null ? "" : String(v));
 const titleCase = (s: string) => s.replace(/\b\w/g, (m) => m.toUpperCase());
 
@@ -116,8 +111,7 @@ function mapApiItemToLead(item: any): Lead {
     item.company_name || raw.company_name || raw.person_company_name || "Unknown Company";
 
   const industry = raw.company_industry || item.industry || "Unknown";
-  const companySize =
-    raw.company_size || raw.company_size_range || item.company_size || "";
+  const companySize = raw.company_size || raw.company_size_range || item.company_size || "";
   const revenue = raw.company_revenue || raw.company_revenue_range || item.company_revenue || "";
 
   const city = raw.person_city || raw.company_city || "";
@@ -170,6 +164,7 @@ function tryParseArray(v: any): string[] | any[] | undefined {
   }
 }
 
+/** ---- component ---- */
 export default function LeadsDatabase() {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [filteredLeads, setFilteredLeads] = useState<Lead[]>([]);
@@ -190,9 +185,13 @@ export default function LeadsDatabase() {
   const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
   const [addingToCampaign, setAddingToCampaign] = useState(false);
 
-  // Load real leads
+  // Inline "create campaign" UI
+  const [newCampaignName, setNewCampaignName] = useState("");
+  const [creatingCampaign, setCreatingCampaign] = useState(false);
+
+  /** load leads */
   useEffect(() => {
-    const run = async () => {
+    (async () => {
       try {
         setLoading(true);
         setErr(null);
@@ -219,11 +218,10 @@ export default function LeadsDatabase() {
       } finally {
         setLoading(false);
       }
-    };
-    run();
+    })();
   }, []);
 
-  // Derived filters
+  /** derived filters */
   const uniqueIndustries = useMemo(
     () => [...new Set(leads.map((l) => l.industry).filter(Boolean))].sort(),
     [leads]
@@ -233,7 +231,7 @@ export default function LeadsDatabase() {
     [leads]
   );
 
-  // Filter as user types / selects
+  /** apply filters */
   useEffect(() => {
     let data = [...leads];
 
@@ -247,7 +245,6 @@ export default function LeadsDatabase() {
           l.location.toLowerCase().includes(q)
       );
     }
-
     if (industryFilter !== "all") data = data.filter((l) => l.industry === industryFilter);
     if (sizeFilter !== "all") data = data.filter((l) => l.companySize === sizeFilter);
 
@@ -259,12 +256,11 @@ export default function LeadsDatabase() {
       prev.length === filteredLeads.length ? [] : filteredLeads.map((l) => l.id)
     );
   };
-
   const toggleRow = (id: string) => {
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   };
 
-  const scorePill = (n: number) => {
+  const scoreBadge = (n: number) => {
     if (n >= 90) return <Badge className="bg-green-100 text-green-800">Hot</Badge>;
     if (n >= 75) return <Badge className="bg-amber-100 text-amber-800">Warm</Badge>;
     return <Badge className="bg-gray-100 text-gray-800">Cold</Badge>;
@@ -318,18 +314,16 @@ export default function LeadsDatabase() {
     URL.revokeObjectURL(url);
   };
 
-  // -------- Campaign wiring --------
+  /** -------- Campaigns wiring -------- */
   const openCampaignsDialog = (ids?: string[]) => {
     if (ids && ids.length) setSelected(ids);
     setCampaignsOpen(true);
   };
 
+  // Load campaigns each time the dialog opens (fresh list)
   useEffect(() => {
-    // lazy-load campaigns when dialog opens
-    const load = async () => {
-      if (!campaignsOpen) return;
-      if (campaigns.length > 0) return;
-
+    if (!campaignsOpen) return;
+    (async () => {
       setCampaignLoading(true);
       try {
         let list: CampaignLite[] = [];
@@ -341,7 +335,6 @@ export default function LeadsDatabase() {
             name: c.name || c.title || c.campaignName || "Untitled Campaign",
           }));
         } else {
-          // generic REST fallback
           const r = await fetch("/api/campaigns");
           if (r.ok) {
             const j = await r.json();
@@ -354,17 +347,56 @@ export default function LeadsDatabase() {
         }
 
         setCampaigns(list);
+        // if nothing selected yet, preselect first option if available
         if (!selectedCampaignId && list.length) setSelectedCampaignId(list[0].id);
       } catch (e) {
         console.warn("Failed to load campaigns", e);
       } finally {
         setCampaignLoading(false);
       }
-    };
-
-    void load();
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [campaignsOpen]);
+
+  const doCreateCampaignInline = async () => {
+    if (!newCampaignName.trim()) return;
+    setCreatingCampaign(true);
+    try {
+      let created: CampaignLite | null = null;
+
+      if (campaignsService?.createCampaign) {
+        const res = await campaignsService.createCampaign(newCampaignName.trim());
+        created = {
+          id: res.id || res.campaignId || res.key,
+          name: res.name || res.title || newCampaignName.trim(),
+        };
+      } else {
+        const r = await fetch("/api/campaigns", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: newCampaignName.trim() }),
+        });
+        if (!r.ok) throw new Error(`POST /api/campaigns -> ${r.status}`);
+        const j = await r.json();
+        created = {
+          id: j.id || j.campaignId || j.key,
+          name: j.name || j.title || newCampaignName.trim(),
+        };
+      }
+
+      if (created) {
+        const next = [created, ...campaigns];
+        setCampaigns(next);
+        setSelectedCampaignId(created.id);
+        setNewCampaignName("");
+      }
+    } catch (e: any) {
+      console.error(e);
+      alert(e?.message || "Failed to create campaign.");
+    } finally {
+      setCreatingCampaign(false);
+    }
+  };
 
   const doAddToCampaign = async () => {
     const toAdd = filteredLeads.filter((l) => selected.includes(l.id));
@@ -372,7 +404,6 @@ export default function LeadsDatabase() {
 
     setAddingToCampaign(true);
     try {
-      // payload you’ll persist / upsert, then associate
       const payload = toAdd.map((l) => ({
         id: l.id,
         company_name: l.companyName,
@@ -412,13 +443,14 @@ export default function LeadsDatabase() {
     }
   };
 
+  /** ---- UI ---- */
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Leads Database</h1>
-        <p className="text-gray-600 mt-1">Access 70M+ business records with AI-powered insights</p>
+          <p className="text-gray-600 mt-1">Access 70M+ business records with AI-powered insights</p>
         </div>
         <div className="flex space-x-2">
           <Button
@@ -432,38 +464,37 @@ export default function LeadsDatabase() {
             Export All ({filteredLeads.length})
           </Button>
 
+          {/* Export selected */}
           <Dialog open={exportOpen} onOpenChange={setExportOpen}>
-            <DialogTrigger asChild>
-              <Button variant="outline" disabled={selected.length === 0}>
-                <Download className="w-4 h-4 mr-2" />
-                Export Selected ({selected.length})
-              </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Export Selected Leads</DialogTitle>
-                <DialogDescription>
-                  Export {selected.length} selected leads to CSV format.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="flex justify-end space-x-2">
-                <Button variant="outline" onClick={() => setExportOpen(false)}>
-                  Cancel
-                </Button>
-                <Button
-                  onClick={() => {
-                    exportCSV(
-                      filteredLeads.filter((l) => selected.includes(l.id)),
-                      `svara_selected_${new Date().toISOString().slice(0, 10)}.csv`
-                    );
-                    setExportOpen(false);
-                  }}
-                >
-                  <Download className="w-4 h-4 mr-2" />
-                  Export CSV
-                </Button>
-              </div>
-            </DialogContent>
+            <Button variant="outline" disabled={selected.length === 0} onClick={() => setExportOpen(true)}>
+              <Download className="w-4 h-4 mr-2" />
+              Export Selected ({selected.length})
+            </Button>
+            {exportOpen && (
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Export Selected Leads</DialogTitle>
+                  <DialogDescription>Export {selected.length} selected leads to CSV format.</DialogDescription>
+                </DialogHeader>
+                <div className="flex justify-end space-x-2">
+                  <Button variant="outline" onClick={() => setExportOpen(false)}>
+                    Cancel
+                  </Button>
+                  <Button
+                    onClick={() => {
+                      exportCSV(
+                        filteredLeads.filter((l) => selected.includes(l.id)),
+                        `svara_selected_${new Date().toISOString().slice(0, 10)}.csv`
+                      );
+                      setExportOpen(false);
+                    }}
+                  >
+                    <Download className="w-4 h-4 mr-2" />
+                    Export CSV
+                  </Button>
+                </div>
+              </DialogContent>
+            )}
           </Dialog>
 
           <Button
@@ -477,7 +508,7 @@ export default function LeadsDatabase() {
         </div>
       </div>
 
-      {/* Error notice */}
+      {/* Error */}
       {err && (
         <Alert className="border-amber-200 bg-amber-50">
           <AlertCircle className="h-4 w-4 text-amber-600" />
@@ -529,7 +560,7 @@ export default function LeadsDatabase() {
         </Card>
       </div>
 
-      {/* Search + Filters */}
+      {/* Search / Filters */}
       <div className="flex items-center gap-4">
         <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
@@ -629,12 +660,7 @@ export default function LeadsDatabase() {
                       {l.website && (
                         <div className="text-sm text-gray-500 flex items-center">
                           <ExternalLink className="w-3 h-3 mr-1" />
-                          <a
-                            href={l.website}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="hover:text-indigo-600"
-                          >
+                          <a href={l.website} target="_blank" rel="noopener noreferrer" className="hover:text-indigo-600">
                             {l.website.replace(/^https?:\/\//, "")}
                           </a>
                         </div>
@@ -667,7 +693,7 @@ export default function LeadsDatabase() {
                   <TableCell>
                     <div className="flex items-center gap-2">
                       <span className="text-sm font-medium">{l.leadScore}</span>
-                      {scorePill(l.leadScore)}
+                      {scoreBadge(l.leadScore)}
                     </div>
                   </TableCell>
 
@@ -822,13 +848,11 @@ export default function LeadsDatabase() {
                     <div className="text-center">
                       <div className="text-2xl font-bold text-indigo-600">{viewLead.leadScore}</div>
                       <div className="text-sm text-gray-500">Lead Score</div>
-                      <div className="mt-1">{scorePill(viewLead.leadScore)}</div>
+                      <div className="mt-1">{scoreBadge(viewLead.leadScore)}</div>
                     </div>
                     {viewLead.pdlEnriched && viewLead.pdlEnrichmentScore && (
                       <div className="text-center">
-                        <div className="text-2xl font-bold text-purple-600">
-                          {viewLead.pdlEnrichmentScore}
-                        </div>
+                        <div className="text-2xl font-bold text-purple-600">{viewLead.pdlEnrichmentScore}</div>
                         <div className="text-sm text-gray-500">Enrichment Score</div>
                         <Badge className="bg-purple-100 text-purple-800">PDL Verified</Badge>
                       </div>
@@ -966,10 +990,7 @@ export default function LeadsDatabase() {
                 <Button variant="outline" onClick={() => setViewLead(null)}>
                   Close
                 </Button>
-                <Button
-                  className="bg-indigo-600 hover:bg-indigo-700"
-                  onClick={() => openCampaignsDialog([viewLead.id])}
-                >
+                <Button className="bg-indigo-600 hover:bg-indigo-700" onClick={() => openCampaignsDialog([viewLead.id])}>
                   <Plus className="w-4 h-4 mr-2" />
                   Add to Campaign
                 </Button>
@@ -979,42 +1000,55 @@ export default function LeadsDatabase() {
         </DialogContent>
       </Dialog>
 
-      {/* Add to Campaign dialog */}
+      {/* Add to Campaign dialog (with inline creation) */}
       <Dialog open={campaignsOpen} onOpenChange={setCampaignsOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Add {selected.length} lead{selected.length === 1 ? "" : "s"} to a campaign</DialogTitle>
-            <DialogDescription>Select a campaign to attach the selected leads.</DialogDescription>
+            <DialogTitle>
+              Add {selected.length} lead{selected.length === 1 ? "" : "s"} to a campaign
+            </DialogTitle>
+            <DialogDescription>Select a campaign or create a new one.</DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-3">
-            <label className="text-sm font-medium text-gray-700">Campaign</label>
-            <Select
-              value={selectedCampaignId}
-              onValueChange={(v) => setSelectedCampaignId(v)}
-              disabled={campaignLoading || campaigns.length === 0}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder={campaignLoading ? "Loading..." : "Choose a campaign"} />
-              </SelectTrigger>
-              <SelectContent>
-                {campaigns.map((c) => (
-                  <SelectItem key={c.id} value={c.id}>
-                    {c.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <div className="space-y-4">
+            {/* Existing campaigns dropdown */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-gray-700">Campaign</label>
+              <Select
+                value={selectedCampaignId}
+                onValueChange={(v) => setSelectedCampaignId(v)}
+                disabled={campaignLoading || campaigns.length === 0}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder={campaignLoading ? "Loading..." : "Choose a campaign"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {campaigns.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>
+                      {c.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {campaigns.length === 0 && !campaignLoading && (
+                <p className="text-xs text-gray-500">No campaigns found — create one below.</p>
+              )}
+            </div>
 
-            {campaigns.length === 0 && !campaignLoading && (
-              <div className="text-xs text-gray-500">
-                No campaigns found.{" "}
-                <a href="/campaigns" className="text-indigo-600 hover:text-indigo-800 underline">
-                  Create one
-                </a>{" "}
-                and come back.
+            {/* Inline create */}
+            <div className="space-y-2 border rounded-md p-3">
+              <div className="text-sm font-medium">Create new campaign</div>
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Campaign name"
+                  value={newCampaignName}
+                  onChange={(e) => setNewCampaignName(e.target.value)}
+                />
+                <Button onClick={doCreateCampaignInline} disabled={creatingCampaign || !newCampaignName.trim()}>
+                  {creatingCampaign ? "Creating…" : "Create"}
+                </Button>
               </div>
-            )}
+            </div>
           </div>
 
           <div className="flex justify-end gap-2">
@@ -1035,6 +1069,7 @@ export default function LeadsDatabase() {
   );
 }
 
+/** small helper */
 function Labeled({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
