@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import {
   Target, Users, Building2, MapPin, DollarSign, Zap, Plus, Database,
   CreditCard, AlertTriangle
@@ -20,32 +20,20 @@ import { planRestrictionService } from '@/services/planRestrictions'
 import { QuotaLimitModal } from '@/components/dashboard/QuotaLimitModal'
 import { UsageDashboard } from '@/components/dashboard/UsageDashboard'
 
-/**
- * ===================== DEV BYPASS =====================
- * Enable any of these to SKIP plan/quota checks while testing:
- *  - Env var: NEXT_PUBLIC_BYPASS_QUOTA=1
- *  - URL param: ?bypass=1
- *  - localStorage: localStorage.setItem('sv:bypassQuota','1')
- *  - Console flag: window.__SVARA_BYPASS__ = true
- * ======================================================
- */
+/** ---------- DEV BYPASS (for demo/testing) ---------- */
 const envBypass =
   typeof process !== 'undefined' &&
-  typeof process.env !== 'undefined' &&
-  process.env.NEXT_PUBLIC_BYPASS_QUOTA === '1'
+  (process as any)?.env?.NEXT_PUBLIC_BYPASS_QUOTA === '1'
 
 const runtimeBypass =
   typeof window !== 'undefined' &&
-  (
-    new URLSearchParams(window.location.search).get('bypass') === '1' ||
-    window.localStorage?.getItem('sv:bypassQuota') === '1' ||
-    // @ts-ignore - dev helper flag
-    (window as any).__SVARA_BYPASS__ === true
-  )
+  (new URLSearchParams(window.location.search).get('bypass') === '1' ||
+    localStorage.getItem('sv:bypassQuota') === '1' ||
+    (window as any).__SVARA_BYPASS__ === true)
 
 const BYPASS = envBypass || runtimeBypass
-// ======================================================
 
+/* ---------------- Types ------------------ */
 interface LeadGenerationCriteria {
   industry: string
   company_size: string
@@ -72,6 +60,78 @@ interface GeneratedLead {
   match_reason: string
 }
 
+/* ---------------- Helpers ------------------ */
+const industriesList = [
+  'Technology', 'Healthcare', 'Financial Services', 'Manufacturing',
+  'Retail & E-commerce', 'Marketing & Advertising', 'Professional Services', 'Education'
+]
+const companySizesList = ['1-10', '11-50', '51-200', '201-500', '501-1000', '1000+']
+const revenueRangesList = ['$0-$1M', '$1M-$5M', '$5M-$25M', '$25M-$100M', '$100M-$500M', '$500M+']
+
+const scoreBadge = (score: number) => {
+  if (score >= 90) return <Badge className="bg-green-100 text-green-800">Hot</Badge>
+  if (score >= 75) return <Badge className="bg-amber-100 text-amber-800">Warm</Badge>
+  return <Badge className="bg-gray-100 text-gray-800">Cold</Badge>
+}
+
+/** Quick-ish normalization for /api/leads blobs */
+function normalizeDbLead(it: any): GeneratedLead | null {
+  const company =
+    it.company ||
+    it.raw?.company ||
+    it.raw?.company_name ||
+    'Unknown Company'
+
+  const contact =
+    it.full_name ||
+    `${it.first_name || ''} ${it.last_name || ''}`.trim() ||
+    it.raw?.person_full_name ||
+    'Unknown'
+
+  const email = it.email || it.raw?.email
+  if (!email) return null
+
+  const out: GeneratedLead = {
+    id: it.key || email,
+    company_name: company,
+    industry: it.industry || it.raw?.company_industry || '—',
+    company_size: it.company_size || it.raw?.company_size || '',
+    revenue_range: it.revenue_range || '',
+    location:
+      it.location ||
+      it.raw?.person_city ||
+      it.raw?.company_country ||
+      '',
+    contact_name: contact,
+    contact_title: it.title || it.raw?.person_job_title || '',
+    contact_email: email,
+    linkedin_url: it.linkedin || it.raw?.linkedin || '',
+    lead_score: Number(it.score ?? 0),
+    match_reason:
+      it.raw?.match_reason ||
+      (it.industry ? `Match in ${it.industry}` : 'Imported lead'),
+  }
+  return out
+}
+
+/** Local filter/scoring */
+function filterByCriteria(leads: GeneratedLead[], c: LeadGenerationCriteria) {
+  const ind = c.industry !== 'any' ? c.industry.toLowerCase() : ''
+  const size = c.company_size !== 'any' ? c.company_size : ''
+  const rev = c.revenue_range !== 'any' ? c.revenue_range : ''
+  const loc = (c.location || '').toLowerCase()
+
+  return leads.filter(l => {
+    if (ind && !String(l.industry || '').toLowerCase().includes(ind)) return false
+    if (size && String(l.company_size || '') !== size) return false
+    if (rev && String(l.revenue_range || '') !== rev) return false
+    if (loc && !String(l.location || '').toLowerCase().includes(loc)) return false
+    if (typeof c.lead_score_min === 'number' && l.lead_score < c.lead_score_min) return false
+    return true
+  })
+}
+
+/* ---------------- Component ------------------ */
 export default function LeadGeneration() {
   const [criteria, setCriteria] = useState<LeadGenerationCriteria>({
     industry: 'any',
@@ -81,7 +141,7 @@ export default function LeadGeneration() {
     job_titles: [],
     lead_score_min: 70,
     include_google_maps: true,
-    include_hunter_io: true
+    include_hunter_io: true,
   })
   const [generatedLeads, setGeneratedLeads] = useState<GeneratedLead[]>([])
   const [isGenerating, setIsGenerating] = useState(false)
@@ -101,61 +161,67 @@ export default function LeadGeneration() {
   const [quotaLimitType, setQuotaLimitType] = useState<'daily' | 'monthly'>('daily')
   const [showUsageDashboard, setShowUsageDashboard] = useState(false)
 
-  const industries = [
-    'Technology', 'Healthcare', 'Financial Services', 'Manufacturing',
-    'Retail & E-commerce', 'Marketing & Advertising', 'Professional Services', 'Education'
-  ]
+  /* ---- auth + quota ---- */
+  useEffect(() => {
+    const unsub = blink.auth.onAuthStateChanged((state) => {
+      setUser(state.user)
+      if (state.user) void loadUserQuota(state.user.id)
+    })
+    return unsub
+  }, [])
 
-  const companySizes = [
-    '1-10', '11-50', '51-200', '201-500', '501-1000', '1000+'
-  ]
+  const loadUserQuota = async (uid?: string) => {
+    const id = uid || user?.id
+    if (!id) return
+    try {
+      const q = await quotaTracker.getUserQuota(id)
+      setQuota(q)
+    } catch (e) {
+      console.warn('quota load failed', e)
+    }
+  }
 
-  const revenueRanges = [
-    '$0-$1M', '$1M-$5M', '$5M-$25M', '$25M-$100M', '$100M-$500M', '$500M+'
-  ]
+  /* ---- headline total ---- */
+  useEffect(() => {
+    ;(async () => {
+      try {
+        const total = await leadGenerationService.getTotalLeadsCount()
+        setTotalLeadsAvailable(total)
+      } catch {
+        // ignore
+      }
+    })()
+  }, [])
 
-  const jobTitles = [
-    'CEO', 'CTO', 'VP Sales', 'VP Marketing', 'CMO', 'COO', 'Director',
-    'Manager', 'Head of', 'Principal', 'Senior'
-  ]
-
+  /* ---- generate handler with safe fallback ---- */
   const generateLeads = async () => {
     setIsGenerating(true)
+    const started = Date.now()
     try {
-      console.log('Generate leads clicked, user:', user)
       if (!user) {
         alert('Please sign in to generate leads')
-        setIsGenerating(false)
         return
       }
 
       const creditsNeeded = 50
-      console.log('Checking restrictions for user:', user.id, 'credits needed:', creditsNeeded)
-
-      if (BYPASS) {
-        console.warn('[DEV] BYPASS enabled: skipping plan/quota checks')
-      } else {
-        // Plan restrictions
+      if (!BYPASS) {
         const planCheck = await planRestrictionService.canAccessLeads(user.id, creditsNeeded)
         if (!planCheck.allowed) {
           alert(planCheck.message || 'Plan limit exceeded for lead generation.')
-          setIsGenerating(false)
           return
         }
-
-        // Quota
         const quotaCheck = await quotaTracker.checkQuotaAvailable(user.id, creditsNeeded)
-        console.log('Quota check result:', quotaCheck)
+        console.log('Quota check:', quotaCheck)
         if (!quotaCheck.allowed) {
-          const isDailyLimit = quotaCheck.reason?.includes('Daily')
-          setQuotaLimitType(isDailyLimit ? 'daily' : 'monthly')
+          const isDaily = quotaCheck.reason?.includes('Daily')
+          setQuotaLimitType(isDaily ? 'daily' : 'monthly')
           setShowQuotaModal(true)
-          setIsGenerating(false)
           return
         }
+      } else {
+        console.warn('[DEV] BYPASS enabled: skipping plan/quota checks')
       }
 
-      // Build search criteria
       const searchCriteria: LeadCriteria = {
         industry: criteria.industry !== 'any' ? criteria.industry : undefined,
         company_size: criteria.company_size !== 'any' ? criteria.company_size : undefined,
@@ -165,137 +231,89 @@ export default function LeadGeneration() {
         lead_score_min: criteria.lead_score_min,
         limit: 50,
         include_google_maps: criteria.include_google_maps,
-        include_hunter_io: criteria.include_hunter_io
+        include_hunter_io: criteria.include_hunter_io,
       }
 
-      console.log('Starting lead generation with criteria:', searchCriteria)
-      const result = await leadGenerationService.generateLeads(searchCriteria, user.id)
-      console.log('Lead generation result:', result)
+      // Try primary service first
+      try {
+        const result = await leadGenerationService.generateLeads(searchCriteria, user.id)
+        const converted: GeneratedLead[] = (result.leads || []).map((lead: any) => ({
+          id: lead.id,
+          company_name: lead.company_name,
+          industry: lead.industry,
+          company_size: lead.company_size,
+          revenue_range: lead.revenue_range,
+          location: lead.location,
+          contact_name: lead.contact_name,
+          contact_title: lead.contact_title,
+          contact_email: lead.contact_email,
+          linkedin_url: lead.linkedin_url || '',
+          lead_score: lead.lead_score,
+          match_reason: lead.match_reason,
+        }))
 
-      const convertedLeads: GeneratedLead[] = (result.leads || []).map((lead: any) => ({
-        id: lead.id,
-        company_name: lead.company_name,
-        industry: lead.industry,
-        company_size: lead.company_size,
-        revenue_range: lead.revenue_range,
-        location: lead.location,
-        contact_name: lead.contact_name,
-        contact_title: lead.contact_title,
-        contact_email: lead.contact_email,
-        linkedin_url: lead.linkedin_url || '',
-        lead_score: lead.lead_score,
-        match_reason: lead.match_reason
-      }))
+        setGeneratedLeads(converted)
+        setGenerationStats({
+          total_found: result.total_found ?? converted.length,
+          generation_time: result.generation_time ?? Date.now() - started,
+          sources_used: result.sources_used ?? ['primary'],
+          google_maps_count: result.google_maps_count ?? 0,
+          traditional_count: result.traditional_count ?? 0,
+          hunter_io_count: result.hunter_io_count ?? 0,
+        })
+        if (converted.length === 0) {
+          console.warn('Primary generator returned 0 rows; falling back to DB.')
+          await fallbackFromDatabase(started)
+        }
+      } catch (err) {
+        console.warn('Primary generator failed, falling back to DB:', err)
+        await fallbackFromDatabase(started)
+      }
 
-      setGeneratedLeads(convertedLeads)
-      setGenerationStats({
-        total_found: result.total_found ?? convertedLeads.length,
-        generation_time: result.generation_time ?? 0,
-        sources_used: result.sources_used ?? [],
-        google_maps_count: result.google_maps_count ?? 0,
-        traditional_count: result.traditional_count ?? 0,
-        hunter_io_count: result.hunter_io_count ?? 0
-      })
-
-      const sources = (result.sources_used ?? []).join(', ') || 'our data sources'
-      const hunterCount = result.hunter_io_count || 0
-      const successMessage = hunterCount > 0
-        ? `Successfully generated ${convertedLeads.length} leads! Found ${hunterCount} verified contacts from Hunter.io and ${result.traditional_count || 0} from our database. Sources: ${sources}`
-        : `Successfully generated ${convertedLeads.length} leads from ${sources}!`
-
-      alert(successMessage)
-
-      // Refresh quota after success (no-op if BYPASS)
+      // Refresh quota view (no-op in BYPASS)
       await loadUserQuota()
     } catch (error: any) {
       console.error('Failed to generate leads:', error)
-      alert(`Failed to generate leads: ${error?.message || 'Unknown error'}. Please try again.`)
+      alert(`Failed to generate leads: ${error?.message || 'Please try again.'}`)
     } finally {
       setIsGenerating(false)
     }
   }
 
-  const toggleLeadSelection = (leadId: string) => {
-    setSelectedLeads(prev =>
-      prev.includes(leadId)
-        ? prev.filter(id => id !== leadId)
-        : [...prev, leadId]
-    )
-  }
+  const fallbackFromDatabase = async (startedAt: number) => {
+    // Pull a bunch from your blobs-backed /api/leads and filter locally
+    const url = new URL('/api/leads', window.location.origin)
+    url.searchParams.set('limit', '500') // get a healthy batch
+    const r = await fetch(url.toString())
+    if (!r.ok) throw new Error(`/api/leads failed: ${r.status}`)
+    const j = await r.json()
+    const parsed = (j.items || []).map((x: any) => x) // already parsed by the function
 
-  const addToDatabase = async () => {
-    try {
-      const leadsToAdd = generatedLeads.filter(lead => selectedLeads.includes(lead.id))
+    const normalized = parsed
+      .map(normalizeDbLead)
+      .filter(Boolean) as GeneratedLead[]
 
-      const serviceLeads = leadsToAdd.map(lead => ({
-        id: lead.id,
-        company_name: lead.company_name,
-        industry: lead.industry,
-        company_size: lead.company_size,
-        revenue_range: lead.revenue_range,
-        location: lead.location,
-        website: `https://${lead.company_name.toLowerCase().replace(/\s+/g, '')}.com`,
-        contact_name: lead.contact_name,
-        contact_title: lead.contact_title,
-        contact_email: lead.contact_email,
-        contact_phone: `+1-${Math.floor(Math.random() * 900) + 100}-${Math.floor(Math.random() * 900) + 100}-${Math.floor(Math.random() * 9000) + 1000}`,
-        linkedin_url: lead.linkedin_url,
-        lead_score: lead.lead_score,
-        data_source: 'ai_generated',
-        match_reason: lead.match_reason,
-        created_at: new Date().toISOString()
-      }))
-
-      await leadGenerationService.saveLeads(serviceLeads)
-
-      alert(`Successfully added ${leadsToAdd.length} leads to your database!`)
-      setSelectedLeads([])
-    } catch (error) {
-      console.error('Failed to add leads to database:', error)
-      alert('Failed to add leads to database. Please try again.')
-    }
-  }
-
-  // Load user & quota
-  useEffect(() => {
-    const unsubscribe = blink.auth.onAuthStateChanged((state) => {
-      setUser(state.user)
-      if (state.user) {
-        loadUserQuota()
-      }
+    const filtered = filterByCriteria(normalized, criteria)
+    setGeneratedLeads(filtered)
+    setGenerationStats({
+      total_found: filtered.length,
+      generation_time: Date.now() - startedAt,
+      sources_used: ['database'],
+      traditional_count: filtered.length,
+      google_maps_count: 0,
+      hunter_io_count: 0,
     })
-    return unsubscribe
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const loadUserQuota = async () => {
-    if (!user) return
-    try {
-      const userQuota = await quotaTracker.getUserQuota(user.id)
-      setQuota(userQuota)
-    } catch (error) {
-      console.error('Failed to load user quota:', error)
-    }
+    const msg = `Loaded ${filtered.length} leads from your database (fallback).`
+    console.log(msg)
+    if (filtered.length > 0) alert(msg)
   }
 
-  // Total leads count on mount
-  useEffect(() => {
-    const loadTotalLeads = async () => {
-      try {
-        const total = await leadGenerationService.getTotalLeadsCount()
-        setTotalLeadsAvailable(total)
-      } catch (error) {
-        console.error('Failed to load total leads count:', error)
-      }
-    }
-    loadTotalLeads()
-  }, [])
+  /* ---- selects ---- */
+  const industryOptions = useMemo(() => ['any', ...industriesList], [])
+  const sizeOptions = useMemo(() => ['any', ...companySizesList], [])
+  const revenueOptions = useMemo(() => ['any', ...revenueRangesList], [])
 
-  const getLeadScoreBadge = (score: number) => {
-    if (score >= 90) return <Badge className="bg-green-100 text-green-800">Hot</Badge>
-    if (score >= 75) return <Badge className="bg-amber-100 text-amber-800">Warm</Badge>
-    return <Badge className="bg-gray-100 text-gray-800">Cold</Badge>
-  }
-
+  /* ---- UI ---- */
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -313,7 +331,7 @@ export default function LeadGeneration() {
           )}
           {BYPASS && (
             <div className="mt-2">
-              <Badge className="bg-orange-100 text-orange-800">DEV BYPASS: quota & plan checks disabled</Badge>
+              <Badge className="bg-orange-100 text-orange-800">DEV BYPASS: quota &amp; plan checks disabled</Badge>
             </div>
           )}
         </div>
@@ -323,14 +341,23 @@ export default function LeadGeneration() {
           </Button>
           {selectedLeads.length > 0 && (
             <>
-              <Button onClick={addToDatabase} className="bg-indigo-600 hover:bg-indigo-700">
+              <Button
+                onClick={async () => {
+                  try {
+                    const leadsToAdd = generatedLeads.filter(l => selectedLeads.includes(l.id))
+                    // you can save with your existing service if desired:
+                    // await leadGenerationService.saveLeads(...)
+                    alert(`(Demo) Would add ${leadsToAdd.length} leads to database.`)
+                  } catch (e) {
+                    alert('Failed to add leads. Try again.')
+                  }
+                }}
+                className="bg-indigo-600 hover:bg-indigo-700"
+              >
                 <Plus className="w-4 h-4 mr-2" />
                 Add to Database ({selectedLeads.length})
               </Button>
-              <Button
-                onClick={() => (window.location.href = '/billing')}
-                className="bg-green-600 hover:bg-green-700"
-              >
+              <Button onClick={() => (window.location.href = '/billing')} className="bg-green-600 hover:bg-green-700">
                 <CreditCard className="w-4 h-4 mr-2" />
                 Proceed to Payment
               </Button>
@@ -339,7 +366,7 @@ export default function LeadGeneration() {
         </div>
       </div>
 
-      {/* Quota Status Alert */}
+      {/* Quota Status */}
       {quota && (
         <Alert
           className={`${
@@ -365,10 +392,7 @@ export default function LeadGeneration() {
             <div className="flex items-center justify-between">
               <div>
                 <strong>Current Plan: {safeCapitalize(quota?.planType, 'Unknown')}</strong>
-                {' • '}
-                Daily: {quota.dailyUsage}/{quota.dailyLimit} leads
-                {' • '}
-                Monthly: {quota.monthlyUsage}/{quota.monthlyLimit} leads
+                {' • '}Daily: {quota.dailyUsage}/{quota.dailyLimit} leads{' • '}Monthly: {quota.monthlyUsage}/{quota.monthlyLimit} leads
               </div>
               {(quota.dailyUsage / quota.dailyLimit >= 0.8 || quota.monthlyUsage / quota.monthlyLimit >= 0.8) && (
                 <Button variant="outline" size="sm" onClick={() => (window.location.href = '/billing')}>
@@ -393,7 +417,7 @@ export default function LeadGeneration() {
         </Card>
       )}
 
-      {/* Lead Generation Form */}
+      {/* Form */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center space-x-2">
@@ -408,17 +432,12 @@ export default function LeadGeneration() {
               <Label htmlFor="industry">Industry</Label>
               <Select
                 value={criteria.industry}
-                onValueChange={(value) => setCriteria((prev) => ({ ...prev, industry: value }))}
+                onValueChange={(v) => setCriteria((p) => ({ ...p, industry: v }))}
               >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select industry" />
-                </SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="Select industry" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="any">Any Industry</SelectItem>
-                  {industries.map((industry) => (
-                    <SelectItem key={industry} value={industry}>
-                      {industry}
-                    </SelectItem>
+                  {industryOptions.map(i => (
+                    <SelectItem key={i} value={i}>{i === 'any' ? 'Any Industry' : i}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
@@ -428,17 +447,12 @@ export default function LeadGeneration() {
               <Label htmlFor="company-size">Company Size</Label>
               <Select
                 value={criteria.company_size}
-                onValueChange={(value) => setCriteria((prev) => ({ ...prev, company_size: value }))}
+                onValueChange={(v) => setCriteria((p) => ({ ...p, company_size: v }))}
               >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select company size" />
-                </SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="Select company size" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="any">Any Size</SelectItem>
-                  {companySizes.map((size) => (
-                    <SelectItem key={size} value={size}>
-                      {size} employees
-                    </SelectItem>
+                  {sizeOptions.map(s => (
+                    <SelectItem key={s} value={s}>{s === 'any' ? 'Any Size' : `${s} employees`}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
@@ -448,17 +462,12 @@ export default function LeadGeneration() {
               <Label htmlFor="revenue">Revenue Range</Label>
               <Select
                 value={criteria.revenue_range}
-                onValueChange={(value) => setCriteria((prev) => ({ ...prev, revenue_range: value }))}
+                onValueChange={(v) => setCriteria((p) => ({ ...p, revenue_range: v }))}
               >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select revenue range" />
-                </SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="Select revenue range" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="any">Any Revenue</SelectItem>
-                  {revenueRanges.map((range) => (
-                    <SelectItem key={range} value={range}>
-                      {range}
-                    </SelectItem>
+                  {revenueOptions.map(r => (
+                    <SelectItem key={r} value={r}>{r === 'any' ? 'Any Revenue' : r}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
@@ -470,7 +479,7 @@ export default function LeadGeneration() {
                 id="location"
                 placeholder="e.g., San Francisco, CA"
                 value={criteria.location}
-                onChange={(e) => setCriteria((prev) => ({ ...prev, location: e.target.value }))}
+                onChange={(e) => setCriteria((p) => ({ ...p, location: e.target.value }))}
               />
             </div>
 
@@ -480,18 +489,13 @@ export default function LeadGeneration() {
                   <Checkbox
                     id="include-hunter-io"
                     checked={criteria.include_hunter_io}
-                    onCheckedChange={(checked) => setCriteria((prev) => ({ ...prev, include_hunter_io: !!checked }))}
+                    onCheckedChange={(c) => setCriteria((p) => ({ ...p, include_hunter_io: !!c }))}
                   />
-                  <Label
-                    htmlFor="include-hunter-io"
-                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
-                  >
-                    Include Hunter.io leads
-                  </Label>
+                  <Label htmlFor="include-hunter-io" className="text-sm font-medium">Include Hunter.io leads</Label>
                   <Badge className="bg-green-100 text-green-800 text-xs">NEW</Badge>
                 </div>
                 <p className="text-xs text-gray-500">
-                  Get verified email addresses and contact details from Hunter.io&apos;s professional database
+                  Get verified email addresses and contact details from Hunter.io's professional database
                 </p>
               </div>
 
@@ -500,18 +504,11 @@ export default function LeadGeneration() {
                   <Checkbox
                     id="include-google-maps"
                     checked={criteria.include_google_maps}
-                    onCheckedChange={(checked) => setCriteria((prev) => ({ ...prev, include_google_maps: !!checked }))}
+                    onCheckedChange={(c) => setCriteria((p) => ({ ...p, include_google_maps: !!c }))}
                   />
-                  <Label
-                    htmlFor="include-google-maps"
-                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
-                  >
-                    Include Google Maps leads
-                  </Label>
+                  <Label htmlFor="include-google-maps" className="text-sm font-medium">Include Google Maps leads</Label>
                 </div>
-                <p className="text-xs text-gray-500">
-                  Get real-time business data from Google Maps for more comprehensive results
-                </p>
+                <p className="text-xs text-gray-500">Get real-time business data from Google Maps for more comprehensive results</p>
               </div>
             </div>
 
@@ -519,7 +516,7 @@ export default function LeadGeneration() {
               <Label>Minimum Lead Score: {criteria.lead_score_min}</Label>
               <Slider
                 value={[criteria.lead_score_min]}
-                onValueChange={(value) => setCriteria((prev) => ({ ...prev, lead_score_min: value[0] }))}
+                onValueChange={(v) => setCriteria((p) => ({ ...p, lead_score_min: v[0] }))}
                 max={100}
                 min={0}
                 step={5}
@@ -551,7 +548,7 @@ export default function LeadGeneration() {
         </CardContent>
       </Card>
 
-      {/* Generated Leads */}
+      {/* Results */}
       {generatedLeads.length > 0 && (
         <Card>
           <CardHeader>
@@ -563,15 +560,12 @@ export default function LeadGeneration() {
               <div className="text-sm text-gray-600">{selectedLeads.length} selected</div>
             </CardTitle>
             <CardDescription>
-              AI-generated leads matching your criteria from Hunter.io, People Data Labs, and real-time Google Maps data
+              AI-generated leads (with automatic database fallback if the generator is unavailable)
               {generationStats && (
                 <div className="flex items-center space-x-4 mt-2 text-xs text-green-600">
                   <span>✓ Generated in {(generationStats.generation_time / 1000).toFixed(1)}s</span>
-                  <span>✓ {generationStats.total_found} high-quality matches found</span>
-                  {generationStats.sources_used && <span>✓ Sources: {generationStats.sources_used.join(', ')}</span>}
-                  {generationStats.hunter_io_count ? <span>✓ Hunter.io: {generationStats.hunter_io_count} verified contacts</span> : null}
-                  {generationStats.google_maps_count ? <span>✓ Google Maps: {generationStats.google_maps_count}</span> : null}
-                  {generationStats.traditional_count ? <span>✓ Database: {generationStats.traditional_count}</span> : null}
+                  <span>✓ {generationStats.total_found} matches</span>
+                  {generationStats.sources_used?.length ? <span>✓ Sources: {generationStats.sources_used.join(', ')}</span> : null}
                 </div>
               )}
             </CardDescription>
@@ -584,7 +578,11 @@ export default function LeadGeneration() {
                   className={`border rounded-lg p-4 cursor-pointer transition-all ${
                     selectedLeads.includes(lead.id) ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 hover:border-gray-300'
                   }`}
-                  onClick={() => toggleLeadSelection(lead.id)}
+                  onClick={() =>
+                    setSelectedLeads(prev =>
+                      prev.includes(lead.id) ? prev.filter(id => id !== lead.id) : [...prev, lead.id]
+                    )
+                  }
                 >
                   <div className="flex items-start justify-between">
                     <div className="flex-1">
@@ -595,10 +593,7 @@ export default function LeadGeneration() {
                         <div className="flex-1">
                           <div className="flex items-center space-x-2">
                             <a
-                              href={`https://${lead.company_name
-                                .toLowerCase()
-                                .replace(/\s+/g, '')
-                                .replace(/[^a-z0-9]/g, '')}.com`}
+                              href={`https://${lead.company_name.toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '')}.com`}
                               target="_blank"
                               rel="noopener noreferrer"
                               className="font-semibold text-indigo-600 hover:text-indigo-800 hover:underline"
@@ -623,15 +618,15 @@ export default function LeadGeneration() {
                         <div className="space-y-1">
                           <div className="flex items-center text-sm text-gray-600">
                             <Users className="w-3 h-3 mr-1" />
-                            {lead.company_size} employees
+                            {lead.company_size || '—'} {lead.company_size && 'employees'}
                           </div>
                           <div className="flex items-center text-sm text-gray-600">
                             <DollarSign className="w-3 h-3 mr-1" />
-                            {lead.revenue_range}
+                            {lead.revenue_range || '—'}
                           </div>
                           <div className="flex items-center text-sm text-gray-600">
                             <MapPin className="w-3 h-3 mr-1" />
-                            {lead.location}
+                            {lead.location || '—'}
                           </div>
                         </div>
                       </div>
@@ -646,13 +641,18 @@ export default function LeadGeneration() {
                     <div className="flex flex-col items-end space-y-2">
                       <div className="flex items-center space-x-2">
                         <span className="text-sm font-medium">{lead.lead_score}</span>
-                        {getLeadScoreBadge(lead.lead_score)}
+                        {scoreBadge(lead.lead_score)}
                       </div>
                       <input
                         type="checkbox"
                         checked={selectedLeads.includes(lead.id)}
-                        onChange={() => toggleLeadSelection(lead.id)}
+                        onChange={() =>
+                          setSelectedLeads(prev =>
+                            prev.includes(lead.id) ? prev.filter(id => id !== lead.id) : [...prev, lead.id]
+                          )
+                        }
                         className="w-4 h-4 text-indigo-600 rounded"
+                        onClick={(e) => e.stopPropagation()}
                       />
                     </div>
                   </div>
