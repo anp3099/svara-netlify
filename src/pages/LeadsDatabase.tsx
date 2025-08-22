@@ -28,6 +28,15 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 
+// OPTIONAL: use your campaigns service if present
+// Safe to keep — code checks for existence at runtime.
+let campaignsService: any = undefined;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  campaignsService = require("@/services/campaigns");
+  campaignsService = campaignsService?.campaignsService || campaignsService?.default || campaignsService;
+} catch { /* optional */ }
+
 /** UI Lead shape */
 type Lead = {
   id: string;
@@ -45,7 +54,6 @@ type Lead = {
   leadScore: number;
   dataSource: string;
 
-  // optional enrichment (PDL etc) — we’ll just surface if present
   pdlEnriched?: boolean;
   pdlEnrichmentScore?: number;
   pdlExperienceSummary?: string;
@@ -54,6 +62,8 @@ type Lead = {
   pdlEducationSummary?: string;
   pdlSocialProfiles?: Array<{ network: string; url: string }>;
 };
+
+type CampaignLite = { id: string; name: string };
 
 /** Fallback sample list used ONLY if the API returns nothing */
 const sampleLeads: Lead[] = [
@@ -96,8 +106,6 @@ const toStr = (v: any) => (v === undefined || v === null ? "" : String(v));
 const titleCase = (s: string) => s.replace(/\b\w/g, (m) => m.toUpperCase());
 
 function mapApiItemToLead(item: any): Lead {
-  // Your function /api/leads returns objects like:
-  // { key, email, source, score, domain, linkedin, captured_at, raw: {...} }
   const raw = item?.raw ?? {};
 
   const first = raw.first_name || raw.person_first_name || "";
@@ -109,15 +117,8 @@ function mapApiItemToLead(item: any): Lead {
 
   const industry = raw.company_industry || item.industry || "Unknown";
   const companySize =
-    raw.company_size ||
-    raw.company_size_range ||
-    item.company_size ||
-    ""; // if you don't have size, leave empty
-  const revenue =
-    raw.company_revenue ||
-    raw.company_revenue_range ||
-    item.company_revenue ||
-    "";
+    raw.company_size || raw.company_size_range || item.company_size || "";
+  const revenue = raw.company_revenue || raw.company_revenue_range || item.company_revenue || "";
 
   const city = raw.person_city || raw.company_city || "";
   const country = raw.person_country || raw.company_country || "";
@@ -133,7 +134,7 @@ function mapApiItemToLead(item: any): Lead {
   const leadScore = Number(item.score ?? 0);
 
   return {
-    id: item.key || crypto.randomUUID(),
+    id: item.key || (typeof crypto !== "undefined" ? crypto.randomUUID() : String(Math.random())),
     companyName,
     industry: industry ? titleCase(industry) : "Unknown",
     companySize: toStr(companySize),
@@ -148,7 +149,6 @@ function mapApiItemToLead(item: any): Lead {
     leadScore: isNaN(leadScore) ? 0 : leadScore,
     dataSource: toStr(item.source || "import"),
 
-    // Optional enrichment fields if you add them later
     pdlEnriched: Boolean(item.pdl_enriched),
     pdlEnrichmentScore: item.pdl_enrichment_score ? Number(item.pdl_enrichment_score) : undefined,
     pdlExperienceSummary: item.pdl_experience_summary || undefined,
@@ -170,7 +170,6 @@ function tryParseArray(v: any): string[] | any[] | undefined {
   }
 }
 
-/** ---- UI component ---- */
 export default function LeadsDatabase() {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [filteredLeads, setFilteredLeads] = useState<Lead[]>([]);
@@ -183,6 +182,13 @@ export default function LeadsDatabase() {
 
   const [viewLead, setViewLead] = useState<Lead | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+
+  // Campaign dialog state
+  const [campaignsOpen, setCampaignsOpen] = useState(false);
+  const [campaigns, setCampaigns] = useState<CampaignLite[]>([]);
+  const [campaignLoading, setCampaignLoading] = useState(false);
+  const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
+  const [addingToCampaign, setAddingToCampaign] = useState(false);
 
   // Load real leads
   useEffect(() => {
@@ -199,7 +205,6 @@ export default function LeadsDatabase() {
         const mapped = items.map(mapApiItemToLead).sort((a, b) => b.leadScore - a.leadScore);
 
         if (mapped.length === 0) {
-          // Fallback to samples if nothing yet
           setLeads(sampleLeads);
           setFilteredLeads(sampleLeads);
         } else {
@@ -259,7 +264,7 @@ export default function LeadsDatabase() {
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   };
 
-  const scoreBadge = (n: number) => {
+  const scorePill = (n: number) => {
     if (n >= 90) return <Badge className="bg-green-100 text-green-800">Hot</Badge>;
     if (n >= 75) return <Badge className="bg-amber-100 text-amber-800">Warm</Badge>;
     return <Badge className="bg-gray-100 text-gray-800">Cold</Badge>;
@@ -313,13 +318,107 @@ export default function LeadsDatabase() {
     URL.revokeObjectURL(url);
   };
 
+  // -------- Campaign wiring --------
+  const openCampaignsDialog = (ids?: string[]) => {
+    if (ids && ids.length) setSelected(ids);
+    setCampaignsOpen(true);
+  };
+
+  useEffect(() => {
+    // lazy-load campaigns when dialog opens
+    const load = async () => {
+      if (!campaignsOpen) return;
+      if (campaigns.length > 0) return;
+
+      setCampaignLoading(true);
+      try {
+        let list: CampaignLite[] = [];
+
+        if (campaignsService?.listCampaigns) {
+          const res = await campaignsService.listCampaigns();
+          list = (res || []).map((c: any) => ({
+            id: c.id || c.campaignId || c.key,
+            name: c.name || c.title || c.campaignName || "Untitled Campaign",
+          }));
+        } else {
+          // generic REST fallback
+          const r = await fetch("/api/campaigns");
+          if (r.ok) {
+            const j = await r.json();
+            const arr = Array.isArray(j) ? j : j?.items || [];
+            list = arr.map((c: any) => ({
+              id: c.id || c.campaignId || c.key,
+              name: c.name || c.title || c.campaignName || "Untitled Campaign",
+            }));
+          }
+        }
+
+        setCampaigns(list);
+        if (!selectedCampaignId && list.length) setSelectedCampaignId(list[0].id);
+      } catch (e) {
+        console.warn("Failed to load campaigns", e);
+      } finally {
+        setCampaignLoading(false);
+      }
+    };
+
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaignsOpen]);
+
+  const doAddToCampaign = async () => {
+    const toAdd = filteredLeads.filter((l) => selected.includes(l.id));
+    if (!selectedCampaignId || toAdd.length === 0) return;
+
+    setAddingToCampaign(true);
+    try {
+      // payload you’ll persist / upsert, then associate
+      const payload = toAdd.map((l) => ({
+        id: l.id,
+        company_name: l.companyName,
+        industry: l.industry,
+        company_size: l.companySize,
+        revenue_range: l.revenueRange,
+        location: l.location,
+        website: l.website,
+        contact_name: l.contactName,
+        contact_title: l.contactTitle,
+        contact_email: l.contactEmail,
+        contact_phone: l.contactPhone,
+        linkedin_url: l.linkedinUrl,
+        lead_score: l.leadScore,
+        data_source: l.dataSource || "database",
+      }));
+
+      if (campaignsService?.addLeadsToCampaign) {
+        await campaignsService.addLeadsToCampaign(selectedCampaignId, payload);
+      } else {
+        const r = await fetch("/api/campaigns/add-leads", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ campaignId: selectedCampaignId, leads: payload }),
+        });
+        if (!r.ok) throw new Error(`POST /api/campaigns/add-leads -> ${r.status}`);
+      }
+
+      alert(`Added ${toAdd.length} lead${toAdd.length === 1 ? "" : "s"} to the campaign.`);
+      setCampaignsOpen(false);
+      setSelected([]);
+    } catch (e: any) {
+      console.error(e);
+      alert(e?.message || "Failed to add leads to campaign.");
+    } finally {
+      setAddingToCampaign(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Leads Database</h1>
-          <p className="text-gray-600 mt-1">Access 70M+ business records with AI-powered insights</p>
+        <p className="text-gray-600 mt-1">Access 70M+ business records with AI-powered insights</p>
         </div>
         <div className="flex space-x-2">
           <Button
@@ -370,7 +469,7 @@ export default function LeadsDatabase() {
           <Button
             className="bg-indigo-600 hover:bg-indigo-700"
             disabled={selected.length === 0}
-            onClick={() => alert(`Adding ${selected.length} leads to a campaign (stub).`)}
+            onClick={() => openCampaignsDialog()}
           >
             <Plus className="w-4 h-4 mr-2" />
             Add to Campaign
@@ -568,7 +667,7 @@ export default function LeadsDatabase() {
                   <TableCell>
                     <div className="flex items-center gap-2">
                       <span className="text-sm font-medium">{l.leadScore}</span>
-                      {scoreBadge(l.leadScore)}
+                      {scorePill(l.leadScore)}
                     </div>
                   </TableCell>
 
@@ -576,6 +675,14 @@ export default function LeadsDatabase() {
                     <div className="flex items-center gap-2">
                       <Button variant="ghost" size="sm" onClick={() => setViewLead(l)}>
                         View Details
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => openCampaignsDialog([l.id])}
+                        className="text-indigo-600"
+                      >
+                        Add to Campaign
                       </Button>
                       {l.linkedinUrl && (
                         <Button variant="ghost" size="sm" asChild>
@@ -715,7 +822,7 @@ export default function LeadsDatabase() {
                     <div className="text-center">
                       <div className="text-2xl font-bold text-indigo-600">{viewLead.leadScore}</div>
                       <div className="text-sm text-gray-500">Lead Score</div>
-                      <div className="mt-1">{scoreBadge(viewLead.leadScore)}</div>
+                      <div className="mt-1">{scorePill(viewLead.leadScore)}</div>
                     </div>
                     {viewLead.pdlEnriched && viewLead.pdlEnrichmentScore && (
                       <div className="text-center">
@@ -734,7 +841,7 @@ export default function LeadsDatabase() {
                 </CardContent>
               </Card>
 
-              {/* Optional enrichment sections (if you start saving them) */}
+              {/* Optional enrichment sections */}
               {(viewLead.pdlExperienceSummary ||
                 viewLead.pdlEducationSummary ||
                 (viewLead.pdlSkills && viewLead.pdlSkills.length) ||
@@ -861,7 +968,7 @@ export default function LeadsDatabase() {
                 </Button>
                 <Button
                   className="bg-indigo-600 hover:bg-indigo-700"
-                  onClick={() => alert("Add to campaign (stub)")}
+                  onClick={() => openCampaignsDialog([viewLead.id])}
                 >
                   <Plus className="w-4 h-4 mr-2" />
                   Add to Campaign
@@ -871,11 +978,63 @@ export default function LeadsDatabase() {
           )}
         </DialogContent>
       </Dialog>
+
+      {/* Add to Campaign dialog */}
+      <Dialog open={campaignsOpen} onOpenChange={setCampaignsOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add {selected.length} lead{selected.length === 1 ? "" : "s"} to a campaign</DialogTitle>
+            <DialogDescription>Select a campaign to attach the selected leads.</DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <label className="text-sm font-medium text-gray-700">Campaign</label>
+            <Select
+              value={selectedCampaignId}
+              onValueChange={(v) => setSelectedCampaignId(v)}
+              disabled={campaignLoading || campaigns.length === 0}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder={campaignLoading ? "Loading..." : "Choose a campaign"} />
+              </SelectTrigger>
+              <SelectContent>
+                {campaigns.map((c) => (
+                  <SelectItem key={c.id} value={c.id}>
+                    {c.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {campaigns.length === 0 && !campaignLoading && (
+              <div className="text-xs text-gray-500">
+                No campaigns found.{" "}
+                <a href="/campaigns" className="text-indigo-600 hover:text-indigo-800 underline">
+                  Create one
+                </a>{" "}
+                and come back.
+              </div>
+            )}
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setCampaignsOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={!selectedCampaignId || addingToCampaign || selected.length === 0}
+              onClick={doAddToCampaign}
+              className="bg-indigo-600 hover:bg-indigo-700"
+            >
+              {addingToCampaign ? "Adding…" : "Add to Campaign"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-/** small helper component */
 function Labeled({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
