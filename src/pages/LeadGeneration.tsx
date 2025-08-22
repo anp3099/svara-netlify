@@ -25,7 +25,18 @@ import { UsageDashboard } from '@/components/dashboard/UsageDashboard'
  * Set NEXT_PUBLIC_BYPASS_QUOTA=1 to skip plan/quota checks so you can test generation.
  * Remove/disable for production builds.
  */
-const BYPASS = process.env.NEXT_PUBLIC_BYPASS_QUOTA === '1'
+#const BYPASS = process.env.NEXT_PUBLIC_BYPASS_QUOTA === '1'
+// --- DEV BYPASS (works at runtime too) ---
+const envBypass = process.env.NEXT_PUBLIC_BYPASS_QUOTA === '1'
+const runtimeBypass =
+  typeof window !== 'undefined' &&
+  (
+    new URLSearchParams(window.location.search).get('bypass') === '1' ||
+    localStorage.getItem('sv:bypassQuota') === '1' ||
+    // manual toggle: window.__SVARA_BYPASS__ = true
+    (window as any).__SVARA_BYPASS__ === true
+  )
+const BYPASS = envBypass || runtimeBypass
 
 interface LeadGenerationCriteria {
   industry: string
