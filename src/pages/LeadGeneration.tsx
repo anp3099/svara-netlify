@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import {
-  Search, Target, Users, Building2, MapPin, DollarSign, Zap, Plus, Database,
-  CreditCard, AlertTriangle, Badge as LucideBadgeIcon
+  Target, Users, Building2, MapPin, DollarSign, Zap, Plus, Database,
+  CreditCard, AlertTriangle
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -15,28 +15,36 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { blink } from '@/blink/client'
 import { safeCapitalize } from '@/lib/utils'
 import { leadGenerationService, type LeadCriteria } from '@/services/leadGeneration'
-import { quotaTracker, UserQuota } from '@/services/quotaTracker'
+import { quotaTracker, type UserQuota } from '@/services/quotaTracker'
 import { planRestrictionService } from '@/services/planRestrictions'
 import { QuotaLimitModal } from '@/components/dashboard/QuotaLimitModal'
 import { UsageDashboard } from '@/components/dashboard/UsageDashboard'
 
 /**
- * DEV BYPASS:
- * Set NEXT_PUBLIC_BYPASS_QUOTA=1 to skip plan/quota checks so you can test generation.
- * Remove/disable for production builds.
+ * ===================== DEV BYPASS =====================
+ * Enable any of these to SKIP plan/quota checks while testing:
+ *  - Env var: NEXT_PUBLIC_BYPASS_QUOTA=1
+ *  - URL param: ?bypass=1
+ *  - localStorage: localStorage.setItem('sv:bypassQuota','1')
+ *  - Console flag: window.__SVARA_BYPASS__ = true
+ * ======================================================
  */
-#const BYPASS = process.env.NEXT_PUBLIC_BYPASS_QUOTA === '1'
-// --- DEV BYPASS (works at runtime too) ---
-const envBypass = process.env.NEXT_PUBLIC_BYPASS_QUOTA === '1'
+const envBypass =
+  typeof process !== 'undefined' &&
+  typeof process.env !== 'undefined' &&
+  process.env.NEXT_PUBLIC_BYPASS_QUOTA === '1'
+
 const runtimeBypass =
   typeof window !== 'undefined' &&
   (
     new URLSearchParams(window.location.search).get('bypass') === '1' ||
-    localStorage.getItem('sv:bypassQuota') === '1' ||
-    // manual toggle: window.__SVARA_BYPASS__ = true
+    window.localStorage?.getItem('sv:bypassQuota') === '1' ||
+    // @ts-ignore - dev helper flag
     (window as any).__SVARA_BYPASS__ === true
   )
+
 const BYPASS = envBypass || runtimeBypass
+// ======================================================
 
 interface LeadGenerationCriteria {
   industry: string
@@ -121,14 +129,13 @@ export default function LeadGeneration() {
         return
       }
 
-      // Credits needed per generation run
       const creditsNeeded = 50
       console.log('Checking restrictions for user:', user.id, 'credits needed:', creditsNeeded)
 
       if (BYPASS) {
         console.warn('[DEV] BYPASS enabled: skipping plan/quota checks')
       } else {
-        // 1) Plan restrictions
+        // Plan restrictions
         const planCheck = await planRestrictionService.canAccessLeads(user.id, creditsNeeded)
         if (!planCheck.allowed) {
           alert(planCheck.message || 'Plan limit exceeded for lead generation.')
@@ -136,7 +143,7 @@ export default function LeadGeneration() {
           return
         }
 
-        // 2) Quota
+        // Quota
         const quotaCheck = await quotaTracker.checkQuotaAvailable(user.id, creditsNeeded)
         console.log('Quota check result:', quotaCheck)
         if (!quotaCheck.allowed) {
@@ -148,7 +155,7 @@ export default function LeadGeneration() {
         }
       }
 
-      // Build search criteria for the service
+      // Build search criteria
       const searchCriteria: LeadCriteria = {
         industry: criteria.industry !== 'any' ? criteria.industry : undefined,
         company_size: criteria.company_size !== 'any' ? criteria.company_size : undefined,
@@ -165,7 +172,6 @@ export default function LeadGeneration() {
       const result = await leadGenerationService.generateLeads(searchCriteria, user.id)
       console.log('Lead generation result:', result)
 
-      // Convert response to UI format
       const convertedLeads: GeneratedLead[] = (result.leads || []).map((lead: any) => ({
         id: lead.id,
         company_name: lead.company_name,
@@ -199,7 +205,7 @@ export default function LeadGeneration() {
 
       alert(successMessage)
 
-      // Refresh quota after a successful generation (no-op if BYPASS)
+      // Refresh quota after success (no-op if BYPASS)
       await loadUserQuota()
     } catch (error: any) {
       console.error('Failed to generate leads:', error)
@@ -221,7 +227,6 @@ export default function LeadGeneration() {
     try {
       const leadsToAdd = generatedLeads.filter(lead => selectedLeads.includes(lead.id))
 
-      // Convert to service format and save
       const serviceLeads = leadsToAdd.map(lead => ({
         id: lead.id,
         company_name: lead.company_name,
@@ -251,7 +256,7 @@ export default function LeadGeneration() {
     }
   }
 
-  // Load user and quota data
+  // Load user & quota
   useEffect(() => {
     const unsubscribe = blink.auth.onAuthStateChanged((state) => {
       setUser(state.user)
@@ -272,7 +277,7 @@ export default function LeadGeneration() {
     }
   }
 
-  // Load total leads count on mount
+  // Total leads count on mount
   useEffect(() => {
     const loadTotalLeads = async () => {
       try {
