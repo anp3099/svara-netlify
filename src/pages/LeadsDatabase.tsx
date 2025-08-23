@@ -1,6 +1,180 @@
-// Add near imports:
-import campaignService from "@/services/campaigns";
+// src/pages/LeadsDatabase.tsx
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  Search,
+  Filter,
+  Download,
+  Plus,
+  Building2,
+  MapPin,
+  Users,
+  DollarSign,
+  ExternalLink,
+  Star,
+  AlertCircle,
+  Sparkles,
+  Award,
+  BookOpen,
+  Briefcase,
+  ChevronDown,
+} from "lucide-react";
 
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Label } from "@/components/ui/label";
+
+import { blink } from "@/blink/client";
+import * as ReactDOM from "react-dom";
+import campaignService, { campaignsService as _campaignsService } from "@/services/campaigns";
+
+/* ============================== Types ============================== */
+type Lead = {
+  id: string;
+  companyName: string;
+  industry: string;
+  companySize: string;
+  revenueRange: string;
+  location: string;
+  website: string;
+  contactName: string;
+  contactTitle: string;
+  contactEmail: string;
+  contactPhone: string;
+  linkedinUrl: string;
+  leadScore: number;
+  dataSource: string;
+  pdlEnriched?: boolean;
+  pdlEnrichmentScore?: number;
+  pdlExperienceSummary?: string;
+  pdlSkills?: string[];
+  pdlInterests?: string[];
+  pdlEducationSummary?: string;
+  pdlSocialProfiles?: Array<{ network: string; url: string }>;
+};
+
+type Campaign = { id: string; name: string; status?: string; createdAt?: string };
+
+/* ============================== Sample Data ============================== */
+const sampleLeads: Lead[] = [
+  {
+    id: "demo_1",
+    companyName: "TechCorp Solutions",
+    industry: "Software",
+    companySize: "100-500",
+    revenueRange: "$10M-$50M",
+    location: "San Francisco, CA",
+    website: "https://techcorp.com",
+    contactName: "Sarah Johnson",
+    contactTitle: "VP of Sales",
+    contactEmail: "sarah.johnson@techcorp.com",
+    contactPhone: "+1 (555) 123-4567",
+    linkedinUrl: "https://linkedin.com/in/sarahjohnson",
+    leadScore: 92,
+    dataSource: "proprietary",
+  },
+  {
+    id: "demo_2",
+    companyName: "DataFlow Systems",
+    industry: "Data Analytics",
+    companySize: "50-100",
+    revenueRange: "$5M-$10M",
+    location: "Austin, TX",
+    website: "https://dataflow.com",
+    contactName: "Michael Chen",
+    contactTitle: "CTO",
+    contactEmail: "michael.chen@dataflow.com",
+    contactPhone: "+1 (555) 234-5678",
+    linkedinUrl: "https://linkedin.com/in/michaelchen",
+    leadScore: 87,
+    dataSource: "proprietary",
+  },
+];
+
+/* ============================== Helpers ============================== */
+const toStr = (v: any) => (v === undefined || v === null ? "" : String(v));
+const titleCase = (s: string) => s.replace(/\b\w/g, (m) => m.toUpperCase());
+
+function tryParseArray(v: any): string[] | any[] | undefined {
+  if (!v) return undefined;
+  if (Array.isArray(v)) return v;
+  try {
+    const parsed = JSON.parse(v);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function mapApiItemToLead(item: any): Lead {
+  const raw = item?.raw ?? {};
+  const first = raw.first_name || raw.person_first_name || "";
+  const last = raw.last_name || raw.person_last_name || "";
+  const fullName = (item.full_name || `${first} ${last}`).trim();
+  const companyName =
+    item.company_name || raw.company_name || raw.person_company_name || "Unknown Company";
+  const industry = raw.company_industry || item.industry || "Unknown";
+  const companySize = raw.company_size || raw.company_size_range || item.company_size || "";
+  const revenue = raw.company_revenue || raw.company_revenue_range || item.company_revenue || "";
+  const city = raw.person_city || raw.company_city || "";
+  const country = raw.person_country || raw.company_country || "";
+  const location = [city, country].filter(Boolean).join(", ");
+  const domain = item.domain || raw.company_domain || raw.website || raw.company_website || "";
+  const website = domain ? (domain.startsWith("http") ? domain : `https://${domain}`) : "";
+  const title = item.title || raw.person_job_title || raw.person_headline || "";
+  const phone = raw.person_phone || "";
+  const linkedin = item.linkedin || raw.person_linkedin_url || "";
+  const leadScore = Number(item.score ?? 0);
+
+  return {
+    id: item.key || crypto.randomUUID(),
+    companyName,
+    industry: industry ? titleCase(industry) : "Unknown",
+    companySize: toStr(companySize),
+    revenueRange: toStr(revenue),
+    location,
+    website,
+    contactName: fullName || "Unknown",
+    contactTitle: toStr(title),
+    contactEmail: toStr(item.email || raw.person_business_email || raw.person_personal_email || ""),
+    contactPhone: toStr(phone),
+    linkedinUrl: toStr(linkedin),
+    leadScore: isNaN(leadScore) ? 0 : leadScore,
+    dataSource: toStr(item.source || "import"),
+    pdlEnriched: Boolean(item.pdl_enriched),
+    pdlEnrichmentScore: item.pdl_enrichment_score ? Number(item.pdl_enrichment_score) : undefined,
+    pdlExperienceSummary: item.pdl_experience_summary || undefined,
+    pdlSkills: item.pdl_skills ? tryParseArray(item.pdl_skills) : undefined,
+    pdlInterests: item.pdl_interests ? tryParseArray(item.pdl_interests) : undefined,
+    pdlEducationSummary: item.pdl_education_summary || undefined,
+    pdlSocialProfiles: item.pdl_social_profiles ? tryParseArray(item.pdl_social_profiles) : undefined,
+  };
+}
+
+function Labeled({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <label className="text-sm font-medium text-gray-500">{label}</label>
+      <div className="text-sm">{children}</div>
+    </div>
+  );
+}
+
+/* =======================================================================
+   Simple dialog (kept for compatibility) — FIXED variable names
+   ======================================================================= */
 function AddToCampaignDialog({
   open,
   onOpenChange,
@@ -23,6 +197,7 @@ function AddToCampaignDialog({
       setCampaigns(list);
       if (list.length && !campaignId) setCampaignId(list[0].id);
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   async function createNow() {
@@ -30,8 +205,6 @@ function AddToCampaignDialog({
     try {
       setCreating(true);
       const me = await blink.auth.me();
-
-      // pick first product if exists so the campaign is valid
       const products = await blink.db.products.list({ where: { userId: me.id }, limit: 1 });
       const productId = products[0]?.id;
       if (!productId) {
@@ -63,10 +236,7 @@ function AddToCampaignDialog({
 
     try {
       setAttaching(true);
-      const { inserted, skipped } = await campaignService.attachLeads(
-        selectedCampaignId,
-        leadIds
-      );
+      const { inserted, skipped } = await campaignService.attachLeads(campaignId, selectedLeadIds);
       onOpenChange(false);
       alert(
         inserted
@@ -84,7 +254,9 @@ function AddToCampaignDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-lg">
         <DialogHeader>
-          <DialogTitle>Add {selectedLeadIds.length} lead{selectedLeadIds.length > 1 ? "s" : ""} to a campaign</DialogTitle>
+          <DialogTitle>
+            Add {selectedLeadIds.length} lead{selectedLeadIds.length > 1 ? "s" : ""} to a campaign
+          </DialogTitle>
           <DialogDescription>Select a campaign or create a new one.</DialogDescription>
         </DialogHeader>
 
@@ -137,229 +309,42 @@ function AddToCampaignDialog({
   );
 }
 
-// src/pages/LeadsDatabase.tsx
-import React, { useEffect, useMemo, useState } from "react"
-import {
-  Search,
-  Filter,
-  Download,
-  Plus,
-  Building2,
-  MapPin,
-  Users,
-  DollarSign,
-  ExternalLink,
-  Star,
-  AlertCircle,
-  Sparkles,
-  Award,
-  BookOpen,
-  Briefcase,
-  ChevronDown,
-} from "lucide-react"
-
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Checkbox } from "@/components/ui/checkbox"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-
-import { blink } from "@/blink/client"
-import * as ReactDOM from "react-dom"
-import { campaignsService as _campaignsService } from "@/services/campaigns" // ok if missing; we guard
-
-/** ---------- Types ---------- */
-type Lead = {
-  id: string
-  companyName: string
-  industry: string
-  companySize: string
-  revenueRange: string
-  location: string
-  website: string
-  contactName: string
-  contactTitle: string
-  contactEmail: string
-  contactPhone: string
-  linkedinUrl: string
-  leadScore: number
-  dataSource: string
-  pdlEnriched?: boolean
-  pdlEnrichmentScore?: number
-  pdlExperienceSummary?: string
-  pdlSkills?: string[]
-  pdlInterests?: string[]
-  pdlEducationSummary?: string
-  pdlSocialProfiles?: Array<{ network: string; url: string }>
-}
-
-type Campaign = { id: string; name: string; status?: string; createdAt?: string }
-
-/** ---------- Fallback sample rows ---------- */
-const sampleLeads: Lead[] = [
-  {
-    id: "demo_1",
-    companyName: "TechCorp Solutions",
-    industry: "Software",
-    companySize: "100-500",
-    revenueRange: "$10M-$50M",
-    location: "San Francisco, CA",
-    website: "https://techcorp.com",
-    contactName: "Sarah Johnson",
-    contactTitle: "VP of Sales",
-    contactEmail: "sarah.johnson@techcorp.com",
-    contactPhone: "+1 (555) 123-4567",
-    linkedinUrl: "https://linkedin.com/in/sarahjohnson",
-    leadScore: 92,
-    dataSource: "proprietary",
-  },
-  {
-    id: "demo_2",
-    companyName: "DataFlow Systems",
-    industry: "Data Analytics",
-    companySize: "50-100",
-    revenueRange: "$5M-$10M",
-    location: "Austin, TX",
-    website: "https://dataflow.com",
-    contactName: "Michael Chen",
-    contactTitle: "CTO",
-    contactEmail: "michael.chen@dataflow.com",
-    contactPhone: "+1 (555) 234-5678",
-    linkedinUrl: "https://linkedin.com/in/michaelchen",
-    leadScore: 87,
-    dataSource: "proprietary",
-  },
-]
-
-/** ---------- Helpers ---------- */
-const toStr = (v: any) => (v === undefined || v === null ? "" : String(v))
-const titleCase = (s: string) => s.replace(/\b\w/g, (m) => m.toUpperCase())
-
-function tryParseArray(v: any): string[] | any[] | undefined {
-  if (!v) return undefined
-  if (Array.isArray(v)) return v
-  try {
-    const parsed = JSON.parse(v)
-    return Array.isArray(parsed) ? parsed : undefined
-  } catch {
-    return undefined
-  }
-}
-
-function mapApiItemToLead(item: any): Lead {
-  const raw = item?.raw ?? {}
-  const first = raw.first_name || raw.person_first_name || ""
-  const last = raw.last_name || raw.person_last_name || ""
-  const fullName = (item.full_name || `${first} ${last}`).trim()
-  const companyName =
-    item.company_name || raw.company_name || raw.person_company_name || "Unknown Company"
-  const industry = raw.company_industry || item.industry || "Unknown"
-  const companySize = raw.company_size || raw.company_size_range || item.company_size || ""
-  const revenue = raw.company_revenue || raw.company_revenue_range || item.company_revenue || ""
-  const city = raw.person_city || raw.company_city || ""
-  const country = raw.person_country || raw.company_country || ""
-  const location = [city, country].filter(Boolean).join(", ")
-  const domain = item.domain || raw.company_domain || raw.website || raw.company_website || ""
-  const website = domain ? (domain.startsWith("http") ? domain : `https://${domain}`) : ""
-  const title = item.title || raw.person_job_title || raw.person_headline || ""
-  const phone = raw.person_phone || ""
-  const linkedin = item.linkedin || raw.person_linkedin_url || ""
-  const leadScore = Number(item.score ?? 0)
-
-  return {
-    id: item.key || crypto.randomUUID(),
-    companyName,
-    industry: industry ? titleCase(industry) : "Unknown",
-    companySize: toStr(companySize),
-    revenueRange: toStr(revenue),
-    location,
-    website,
-    contactName: fullName || "Unknown",
-    contactTitle: toStr(title),
-    contactEmail: toStr(item.email || raw.person_business_email || raw.person_personal_email || ""),
-    contactPhone: toStr(phone),
-    linkedinUrl: toStr(linkedin),
-    leadScore: isNaN(leadScore) ? 0 : leadScore,
-    dataSource: toStr(item.source || "import"),
-    pdlEnriched: Boolean(item.pdl_enriched),
-    pdlEnrichmentScore: item.pdl_enrichment_score ? Number(item.pdl_enrichment_score) : undefined,
-    pdlExperienceSummary: item.pdl_experience_summary || undefined,
-    pdlSkills: item.pdl_skills ? tryParseArray(item.pdl_skills) : undefined,
-    pdlInterests: item.pdl_interests ? tryParseArray(item.pdl_interests) : undefined,
-    pdlEducationSummary: item.pdl_education_summary || undefined,
-    pdlSocialProfiles: item.pdl_social_profiles ? tryParseArray(item.pdl_social_profiles) : undefined,
-  }
-}
-
-function Labeled({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <label className="text-sm font-medium text-gray-500">{label}</label>
-      <div className="text-sm">{children}</div>
-    </div>
-  )
-}
-
-/** ---------- HTTP helper (throws with status text) ---------- */
-async function httpJSON(input: RequestInfo, init?: RequestInit) {
-  const res = await fetch(input, {
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-    ...init,
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => "")
-    const msg = text || `${init?.method || "GET"} ${typeof input === "string" ? input : ""} -> ${res.status}`
-    throw new Error(msg)
-  }
-  return res.json().catch(() => ({}))
-}
-
-/** ---------- Add-to-Campaign Modal ---------- */
+/* =======================================================================
+   Robust modal used by this page — now delegates to campaignsService
+   ======================================================================= */
 function AddToCampaignModal({
   open,
   onOpenChange,
   leadIds,
   onAttached,
 }: {
-  open: boolean
-  onOpenChange: (v: boolean) => void
-  leadIds: string[]
-  onAttached: () => void
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  leadIds: string[];
+  onAttached: () => void;
 }) {
-  const [campaigns, setCampaigns] = useState<Campaign[]>([])
-  const [loading, setLoading] = useState(false)
-  const [creating, setCreating] = useState(false)
-  const [adding, setAdding] = useState(false)
-  const [selectedCampaignId, setSelectedCampaignId] = useState<string>("")
-  const [newName, setNewName] = useState("")
-  const [err, setErr] = useState<string | null>(null)
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
+  const [newName, setNewName] = useState("");
+  const [err, setErr] = useState<string | null>(null);
 
   const loadCampaigns = async () => {
-    setLoading(true)
-    setErr(null)
+    setLoading(true);
+    setErr(null);
     try {
-      const svc: any = _campaignsService as any
-      let list: any[] | null = null
+      let list: any[] | null = null;
 
-      if (svc?.listCampaigns) list = await svc.listCampaigns()
-      else if (svc?.list) list = await svc.list()
-      else if (svc?.getAll) list = await svc.getAll()
+      if (_campaignsService?.listCampaigns) list = await _campaignsService.listCampaigns();
+      else if (_campaignsService?.list) list = await _campaignsService.list();
+      else if (_campaignsService?.getAll) list = await _campaignsService.getAll();
       else {
-        // direct DB fallback
         list = await (blink as any).db?.campaigns?.list?.({
           orderBy: { createdAt: "desc" },
           limit: 100,
-        })
+        });
       }
 
       const mapped =
@@ -368,161 +353,105 @@ function AddToCampaignModal({
           name: c.name || c.title || "Untitled",
           status: c.status || c.state,
           createdAt: c.createdAt || c.created_at,
-        })) ?? []
+        })) ?? [];
 
-      setCampaigns(mapped)
-      if (mapped.length && !selectedCampaignId) setSelectedCampaignId(mapped[0].id)
+      setCampaigns(mapped);
+      if (mapped.length && !selectedCampaignId) setSelectedCampaignId(mapped[0].id);
     } catch (e: any) {
-      console.warn("Campaigns load failed:", e)
-      setErr("Failed to load campaigns")
+      console.warn("Campaigns load failed:", e);
+      setErr("Failed to load campaigns");
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }
+  };
 
   useEffect(() => {
-    if (open) void loadCampaigns()
+    if (open) void loadCampaigns();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }, [open]);
 
   const createCampaign = async () => {
-    if (!newName.trim()) return
-    setErr(null)
-    setCreating(true)
+    if (!newName.trim()) return;
+    setErr(null);
+    setCreating(true);
     try {
-      const svc: any = _campaignsService as any
-      let created: any = null
-      if (svc?.createCampaign) created = await svc.createCampaign(newName.trim())
-      else if (svc?.create) created = await svc.create({ name: newName.trim() })
+      let created: any = null;
+      if (_campaignsService?.createCampaign) created = await _campaignsService.createCampaign(newName.trim());
+      else if (_campaignsService?.create) created = await _campaignsService.create({ name: newName.trim() });
       else {
-        // DB fallback
         created = await (blink as any).db?.campaigns?.create?.({
           name: newName.trim(),
           status: "draft",
           createdAt: new Date().toISOString(),
-        })
+        });
       }
 
-      if (!created?.id && created?.error) throw new Error(created.error)
+      if (!created?.id && created?.error) throw new Error(created.error);
 
       const newItem: Campaign = {
         id: created.id || created.key,
         name: created.name || newName.trim(),
         status: created.status || "draft",
         createdAt: created.createdAt || created.created_at,
-      }
+      };
 
-      setCampaigns((prev) => [newItem, ...prev])
-      setSelectedCampaignId(newItem.id)
-      setNewName("")
-      setErr(null)
+      setCampaigns((prev) => [newItem, ...prev]);
+      setSelectedCampaignId(newItem.id);
+      setNewName("");
+      setErr(null);
     } catch (e: any) {
-      const m = String(e?.message || e)
-      // If duplicate, auto-select existing
+      const m = String(e?.message || e);
       if (m.toLowerCase().includes("duplicate") || m.toLowerCase().includes("constraint")) {
         const existing = campaigns.find(
-          (c) => c.name.toLowerCase().trim() === newName.toLowerCase().trim(),
-        )
+          (c) => c.name.toLowerCase().trim() === newName.toLowerCase().trim()
+        );
         if (existing) {
-          setSelectedCampaignId(existing.id)
-          setNewName("")
-          setErr(null)
-          return
+          setSelectedCampaignId(existing.id);
+          setNewName("");
+          setErr(null);
+          return;
         }
       }
-      setErr("Constraint violation – duplicate or invalid data")
+      setErr("Constraint violation – duplicate or invalid data");
     } finally {
-      setCreating(false)
+      setCreating(false);
     }
-  }
+  };
 
-  /** Try several ways to attach, then DB fallbacks with auto-discovery of a join table */
+  /** Delegate attachment to campaignsService (handles join table / fallback) */
   const attachLeads = async () => {
-    const uniqueLeadIds = Array.from(new Set(leadIds))
-    if (!selectedCampaignId || uniqueLeadIds.length === 0) return
+    const uniqueLeadIds = Array.from(new Set(leadIds));
+    if (!selectedCampaignId || uniqueLeadIds.length === 0) return;
 
-    setAdding(true)
-    setErr(null)
+    setAdding(true);
+    setErr(null);
     try {
-      // 1) API attempts
-      const apiVariants = [
-        { url: `/api/campaigns/${selectedCampaignId}/leads`, method: "POST" },
-        { url: `/api/campaigns/add-leads`, method: "POST" },
-        { url: `/api/campaigns/attach`, method: "POST" },
-      ] as const
+      const { inserted, skipped } = await _campaignsService.attachLeads(
+        selectedCampaignId,
+        uniqueLeadIds
+      );
 
-      let apiWorked = false
-      for (const v of apiVariants) {
-        try {
-          await httpJSON(v.url, {
-            method: v.method,
-            body: JSON.stringify({ campaignId: selectedCampaignId, leadIds: uniqueLeadIds }),
-          })
-          apiWorked = true
-          break
-        } catch (e) {
-          // try next
-        }
-      }
-
-      if (!apiWorked) {
-        // 2) DB fallback – try join table first
-        const db: any = (blink as any).db
-        if (!db) throw new Error("DB unavailable")
-
-        const dbKeys = Object.keys(db || {})
-        const joinKey =
-          dbKeys.find(
-            (k) =>
-              /campaign/i.test(k) &&
-              /lead/i.test(k) &&
-              typeof db[k]?.create === "function",
-          ) || null
-
-        let success = 0
-
-        if (joinKey) {
-          for (const leadId of uniqueLeadIds) {
-            try {
-              await db[joinKey].create({ campaignId: selectedCampaignId, leadId })
-              success++
-            } catch (e: any) {
-              // ignore duplicates/constraints for individual rows
-              continue
-            }
-          }
-        } else {
-          // last resort: update leads with campaignId
-          const leadsTableKey =
-            dbKeys.find((k) => /^leads$/i.test(k) && typeof db[k]?.update === "function") || "leads"
-          for (const leadId of uniqueLeadIds) {
-            try {
-              await db[leadsTableKey].update(leadId, { campaignId: selectedCampaignId })
-              success++
-            } catch {
-              continue
-            }
-          }
-        }
-
-        if (success === 0) throw new Error("No rows attached (possible schema mismatch)")
-      }
-
-      onAttached()
-      onOpenChange(false)
-      alert(`Attached ${uniqueLeadIds.length} lead(s) to the campaign.`)
+      onAttached();
+      onOpenChange(false);
+      alert(
+        inserted
+          ? `Attached ${inserted} lead(s)${skipped ? `, ${skipped} already attached` : ""}.`
+          : `No rows attached${skipped ? ` (${skipped} already attached)` : ""}.`
+      );
     } catch (e: any) {
-      setErr(String(e?.message || e) || "Failed to add to campaign")
+      setErr(String(e?.message || e) || "Failed to add to campaign");
     } finally {
-      setAdding(false)
+      setAdding(false);
     }
-  }
+  };
 
   return ReactDOM.createPortal(
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-lg">
         <DialogHeader>
-          <DialogTitle>Add {leadIds.length} {leadIds.length === 1 ? "lead" : "leads"} to a campaign</DialogTitle>
+          <DialogTitle>
+            Add {leadIds.length} {leadIds.length === 1 ? "lead" : "leads"} to a campaign
+          </DialogTitle>
           <DialogDescription>Select a campaign or create a new one.</DialogDescription>
         </DialogHeader>
 
@@ -539,14 +468,16 @@ function AddToCampaignModal({
             <Select
               value={selectedCampaignId}
               onValueChange={(v) => {
-                setSelectedCampaignId(v)
-                setErr(null) // clear old banner
+                setSelectedCampaignId(v);
+                setErr(null);
               }}
               disabled={loading || !campaigns.length}
             >
               <SelectTrigger>
                 <SelectValue
-                  placeholder={loading ? "Loading..." : campaigns.length ? "Choose a campaign" : "No campaigns found"}
+                  placeholder={
+                    loading ? "Loading..." : campaigns.length ? "Choose a campaign" : "No campaigns found"
+                  }
                 />
               </SelectTrigger>
               <SelectContent>
@@ -567,8 +498,8 @@ function AddToCampaignModal({
                 placeholder="e.g., Q4 Outreach"
                 value={newName}
                 onChange={(e) => {
-                  setNewName(e.target.value)
-                  if (err) setErr(null)
+                  setNewName(e.target.value);
+                  if (err) setErr(null);
                 }}
                 disabled={creating}
               />
@@ -594,93 +525,94 @@ function AddToCampaignModal({
       </DialogContent>
     </Dialog>,
     document.body
-  )
+  );
 }
 
-/** ---------- Page ---------- */
+/* =======================================================================
+   Page
+   ======================================================================= */
 export default function LeadsDatabase() {
-  const [leads, setLeads] = useState<Lead[]>([])
-  const [filteredLeads, setFilteredLeads] = useState<Lead[]>([])
-  const [selected, setSelected] = useState<string[]>([])
-  const [search, setSearch] = useState("")
-  const [industryFilter, setIndustryFilter] = useState("all")
-  const [sizeFilter, setSizeFilter] = useState("all")
-  const [loading, setLoading] = useState(false)
-  const [err, setErr] = useState<string | null>(null)
-  const [viewLead, setViewLead] = useState<Lead | null>(null)
-  const [exportOpen, setExportOpen] = useState(false)
-  const [addOpen, setAddOpen] = useState(false)
+  const [leads, setLeads] = useState<Lead[]>([]);
+  const [filteredLeads, setFilteredLeads] = useState<Lead[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [search, setSearch] = useState("");
+  const [industryFilter, setIndustryFilter] = useState("all");
+  const [sizeFilter, setSizeFilter] = useState("all");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [viewLead, setViewLead] = useState<Lead | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
 
-  // Load real leads
+  // Load leads
   useEffect(() => {
     const run = async () => {
       try {
-        setLoading(true)
-        setErr(null)
-        const res = await fetch("/api/leads?limit=50")
-        if (!res.ok) throw new Error(`GET /api/leads -> ${res.status}`)
-        const json = await res.json()
-        const items: any[] = json?.items || []
-        const mapped = items.map(mapApiItemToLead).sort((a, b) => b.leadScore - a.leadScore)
+        setLoading(true);
+        setErr(null);
+        const res = await fetch("/api/leads?limit=50");
+        if (!res.ok) throw new Error(`GET /api/leads -> ${res.status}`);
+        const json = await res.json();
+        const items: any[] = json?.items || [];
+        const mapped = items.map(mapApiItemToLead).sort((a, b) => b.leadScore - a.leadScore);
         if (mapped.length === 0) {
-          setLeads(sampleLeads)
-          setFilteredLeads(sampleLeads)
+          setLeads(sampleLeads);
+          setFilteredLeads(sampleLeads);
         } else {
-          setLeads(mapped)
-          setFilteredLeads(mapped)
+          setLeads(mapped);
+          setFilteredLeads(mapped);
         }
       } catch (e: any) {
-        console.error(e)
-        setErr("Failed to load leads from API. Showing sample data.")
-        setLeads(sampleLeads)
-        setFilteredLeads(sampleLeads)
+        console.error(e);
+        setErr("Failed to load leads from API. Showing sample data.");
+        setLeads(sampleLeads);
+        setFilteredLeads(sampleLeads);
       } finally {
-        setLoading(false)
+        setLoading(false);
       }
-    }
-    run()
-  }, [])
+    };
+    run();
+  }, []);
 
-  // Derived filters
+  // Filters
   const uniqueIndustries = useMemo(
     () => [...new Set(leads.map((l) => l.industry).filter(Boolean))].sort(),
-    [leads],
-  )
+    [leads]
+  );
   const uniqueSizes = useMemo(
     () => [...new Set(leads.map((l) => l.companySize).filter(Boolean))].sort(),
-    [leads],
-  )
+    [leads]
+  );
 
-  // Client-side filter
   useEffect(() => {
-    let data = [...leads]
+    let data = [...leads];
     if (search) {
-      const q = search.toLowerCase()
+      const q = search.toLowerCase();
       data = data.filter(
         (l) =>
           l.companyName.toLowerCase().includes(q) ||
           l.contactName.toLowerCase().includes(q) ||
           l.industry.toLowerCase().includes(q) ||
-          l.location.toLowerCase().includes(q),
-      )
+          l.location.toLowerCase().includes(q)
+      );
     }
-    if (industryFilter !== "all") data = data.filter((l) => l.industry === industryFilter)
-    if (sizeFilter !== "all") data = data.filter((l) => l.companySize === sizeFilter)
-    setFilteredLeads(data)
-  }, [leads, search, industryFilter, sizeFilter])
+    if (industryFilter !== "all") data = data.filter((l) => l.industry === industryFilter);
+    if (sizeFilter !== "all") data = data.filter((l) => l.companySize === sizeFilter);
+    setFilteredLeads(data);
+  }, [leads, search, industryFilter, sizeFilter]);
 
   const toggleAll = () => {
-    setSelected((prev) => (prev.length === filteredLeads.length ? [] : filteredLeads.map((l) => l.id)))
-  }
+    setSelected((prev) => (prev.length === filteredLeads.length ? [] : filteredLeads.map((l) => l.id)));
+  };
   const toggleRow = (id: string) => {
-    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
-  }
+    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
 
   const scorePill = (n: number) => {
-    if (n >= 90) return <Badge className="bg-green-100 text-green-800">Hot</Badge>
-    if (n >= 75) return <Badge className="bg-amber-100 text-amber-800">Warm</Badge>
-    return <Badge className="bg-gray-100 text-gray-800">Cold</Badge>
-  }
+    if (n >= 90) return <Badge className="bg-green-100 text-green-800">Hot</Badge>;
+    if (n >= 75) return <Badge className="bg-amber-100 text-amber-800">Warm</Badge>;
+    return <Badge className="bg-gray-100 text-gray-800">Cold</Badge>;
+  };
 
   const exportCSV = (rows: Lead[], filename: string) => {
     const headers = [
@@ -696,7 +628,7 @@ export default function LeadsDatabase() {
       "Website",
       "LinkedIn",
       "Lead Score",
-    ]
+    ];
     const csv = [
       headers.join(","),
       ...rows.map((l) =>
@@ -715,20 +647,20 @@ export default function LeadsDatabase() {
           l.leadScore,
         ]
           .map((x) => `"${String(x ?? "").replace(/"/g, '""')}"`)
-          .join(","),
+          .join(",")
       ),
-    ].join("\n")
+    ].join("\n");
 
-    const blob = new Blob([csv], { type: "text/csv" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = filename
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
-  }
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="space-y-6">
@@ -742,10 +674,7 @@ export default function LeadsDatabase() {
           <Button
             variant="outline"
             onClick={() =>
-              exportCSV(
-                filteredLeads,
-                `svara_all_leads_${new Date().toISOString().slice(0, 10)}.csv`,
-              )
+              exportCSV(filteredLeads, `svara_all_leads_${new Date().toISOString().slice(0, 10)}.csv`)
             }
             disabled={filteredLeads.length === 0}
           >
@@ -771,9 +700,9 @@ export default function LeadsDatabase() {
                   onClick={() => {
                     exportCSV(
                       filteredLeads.filter((l) => selected.includes(l.id)),
-                      `svara_selected_${new Date().toISOString().slice(0, 10)}.csv`,
-                    )
-                    setExportOpen(false)
+                      `svara_selected_${new Date().toISOString().slice(0, 10)}.csv`
+                    );
+                    setExportOpen(false);
                   }}
                 >
                   <Download className="w-4 h-4 mr-2" />
@@ -1280,10 +1209,8 @@ export default function LeadsDatabase() {
         open={addOpen}
         onOpenChange={setAddOpen}
         leadIds={selected}
-        onAttached={() => {
-          setSelected([])
-        }}
+        onAttached={() => setSelected([])}
       />
     </div>
-  )
+  );
 }
