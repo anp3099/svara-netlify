@@ -1,8 +1,7 @@
 // netlify/functions/campaigns.ts
 import type { Handler } from "@netlify/functions";
 
-/* ------------------------------- utilities ------------------------------ */
-
+/* ---------------------------- small helpers ---------------------------- */
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const json = (code: number, body: unknown) => ({
   statusCode: code,
@@ -10,101 +9,119 @@ const json = (code: number, body: unknown) => ({
   body: JSON.stringify(body),
 });
 
-type AttachResult = { inserted: number; skipped: number };
+type AttachResult = { inserted: number; skipped: number; reason?: string; debug?: any };
 
 const isDup = (e: any) =>
   /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
 
-function findTable(
-  db: any,
-  pattern: RegExp,
-  needs: Array<"create" | "update" | "upsert" | "patch">
-) {
-  const keys = Object.keys(db || {});
-  for (const k of keys) {
-    if (!pattern.test(k)) continue;
-    const t = db[k];
-    if (needs.some((m) => typeof t?.[m] === "function")) return t;
-  }
-  return null;
+function keysOf(obj: any): string[] {
+  return Object.keys(obj || {});
 }
 
-/** Prefer a project helper if available; otherwise try common paths. */
+function findJoinTableKey(db: any): string | null {
+  const keys = keysOf(db);
+  // likely names first
+  const preferred = [
+    "campaignsLeads",
+    "campaign_leads",
+    "campaigns_leads",
+    "campaignLead",
+    "leadCampaign",
+  ];
+  for (const k of preferred) if (typeof db?.[k]?.create === "function") return k;
+
+  // generic discovery
+  const found =
+    keys.find(
+      (k) =>
+        /campaign/i.test(k) &&
+        /lead/i.test(k) &&
+        typeof db?.[k]?.create === "function"
+    ) ?? null;
+
+  return found;
+}
+
+function findLeadsTableKey(db: any): string | null {
+  const keys = keysOf(db);
+
+  // Try obvious ones
+  const preferred = [
+    "leads",
+    "lead",
+    "contacts",
+    "prospects",
+    "people",
+    "persons",
+    "records",
+    "realLeadDatabase",
+    "leadDatabase",
+    "realLeads",
+  ];
+  for (const k of preferred) {
+    const t = db?.[k];
+    if (t && (typeof t.update === "function" || typeof t.upsert === "function" || typeof t.patch === "function"))
+      return k;
+  }
+
+  // Heuristic: include anything with "lead" but NOT "campaign"
+  const discovered = keys.find((k) => {
+    if (/campaign/i.test(k)) return false;
+    if (!/lead|contact|prospect|people|person|record/i.test(k)) return false;
+    const t = db?.[k];
+    return typeof t?.update === "function" || typeof t?.upsert === "function" || typeof t?.patch === "function";
+  });
+
+  return discovered ?? null;
+}
+
+/** Avoid fragile aliased imports. Try common paths, else global. */
 function getBlink(): any {
+  let req: any;
   try {
-    // If you keep a helper in the functions folder
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const u = require("./_utils");
-    if (typeof u.getBlink === "function") {
-      const b = u.getBlink();
-      if (b) return b;
-    }
+    // eslint-disable-next-line no-eval
+    req = (eval as any)("require");
   } catch {}
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const m = require("../../src/lib/blink");
-    return m.default ?? m.blink ?? m;
-  } catch {}
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const m = require("../../lib/blink");
-    return m.default ?? m.blink ?? m;
-  } catch {}
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const m = require("@/lib/blink");
-    return m.default ?? m.blink ?? m;
-  } catch {}
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const m = require("@/blink/client");
-    return m.blink ?? m.default ?? m;
-  } catch {}
+  const tryPaths = [
+    "../../src/blink/client",
+    "../../src/lib/blink",
+    "../../lib/blink",
+  ];
+  for (const p of tryPaths) {
+    try {
+      const m = req(p);
+      if (m?.blink) return m.blink;
+      if (m?.default) return m.default;
+      return m;
+    } catch {}
+  }
   return (globalThis as any).blink ?? null;
 }
 
-/** Extract campaignId from query/body and from any path hints Netlify preserves. */
 function extractCampaignId(event: any, body: any): string | null {
-  // 1) Query param or body
   let id = event?.queryStringParameters?.id || body?.campaignId || "";
-
-  // 2) Try to parse from any path-like strings (covers redirects & raw URLs)
-  const haystack =
-    (event?.path || "") +
-    " " +
-    (event?.rawUrl || "") +
-    " " +
-    (event?.headers?.["x-nf-original-pathname"] || "") +
-    " " +
-    (event?.headers?.["x-original-uri"] || "");
-
+  const haystack = [
+    event?.path || "",
+    (event as any)?.rawUrl || "",
+    event?.headers?.["x-nf-original-pathname"] || "",
+    event?.headers?.["x-original-uri"] || "",
+  ].join(" ");
   const m =
     haystack.match(/\/campaigns\/([^/]+)\/leads\/?(\?|$)/i) ||
     haystack.match(/\/api\/campaigns\/([^/]+)\/leads\/?(\?|$)/i);
-
   if (!id && m) id = m[1];
   return id || null;
 }
 
 /* -------------------------------- handler ------------------------------ */
-
 export const handler: Handler = async (event) => {
-  // Health/debug: GET /.netlify/functions/campaigns
+  // Health check
   if (event.httpMethod === "GET") {
     return json(200, { ok: true, path: event.path, rawUrl: (event as any).rawUrl ?? null });
   }
-
   if (event.httpMethod !== "POST") return json(405, { error: "Method not allowed" });
 
-  // Parse body safely
-  const body = (() => {
-    try {
-      return JSON.parse(event.body || "{}");
-    } catch {
-      return {};
-    }
-  })();
-
+  const body = (() => { try { return JSON.parse(event.body || "{}"); } catch { return {}; } })();
   const campaignId = extractCampaignId(event, body);
   const leadIds: string[] = Array.isArray(body?.leadIds) ? body.leadIds.filter(Boolean) : [];
 
@@ -113,51 +130,52 @@ export const handler: Handler = async (event) => {
 
   const blink = getBlink();
   const db: any = blink?.db;
-  if (!db) return json(500, { error: "DB unavailable on server" });
+  if (!db) return json(200, { inserted: 0, skipped: 0, reason: "DB unavailable on server" } as AttachResult);
 
-  // Discover tables
-  const join = findTable(db, /campaign.*lead|lead.*campaign|^campaign[_]?leads?$/i, ["create", "upsert"]);
-  const leadsTbl = findTable(db, /^leads?$|prospect|contact|people|persons|records/i, ["create", "update", "upsert", "patch"]);
+  const dbKeys = keysOf(db);
+  const joinKey = findJoinTableKey(db);
+  const leadsKey = findLeadsTableKey(db);
 
-  // Ensure lead rows exist (useful if FK constraints exist)
-  if (leadsTbl) {
+  // Try to ensure leads exist if we have a leads table (for FK safety)
+  if (leadsKey) {
+    const leadsTbl: any = db[leadsKey];
     const me = await blink.auth?.me?.().catch(() => null);
     for (const lid of Array.from(new Set(leadIds))) {
       const candidates = [{ id: lid, userId: me?.id }, { id: lid, user_id: me?.id }, { id: lid }];
       for (const c of candidates) {
         try {
-          if (typeof leadsTbl.upsert === "function") {
-            await leadsTbl.upsert({ where: { id: lid }, update: {}, create: c });
-            break;
-          }
-          if (typeof leadsTbl.create === "function") {
-            await leadsTbl.create(c);
-            break;
-          }
-        } catch (e) {
-          if (isDup(e)) break; // already exists
-        }
+          if (typeof leadsTbl.upsert === "function") { await leadsTbl.upsert({ where: { id: lid }, update: {}, create: c }); break; }
+          if (typeof leadsTbl.create === "function") { await leadsTbl.create(c); break; }
+        } catch (e) { if (isDup(e)) break; }
       }
     }
   }
 
-  // Attach via join table if present
-  let inserted = 0;
-  let skipped = 0;
+  let inserted = 0, skipped = 0;
 
-  if (join) {
-    const attachOne = async (lid: string): Promise<"ok" | "dup" | "fail"> => {
-      const shapes = [
-        { campaignId, leadId: lid },
-        { campaign_id: campaignId, lead_id: lid },
-        { campaign: campaignId, lead: lid },
-      ];
-      for (const s of shapes) {
-        try {
-          await join.create(s);
-          return "ok";
-        } catch (e) {
-          if (isDup(e)) return "dup";
+  // 1) Join table path (most correct)
+  if (joinKey) {
+    const join = db[joinKey];
+
+    const campaignKeys = ["campaignId", "campaign_id", "campaign", "campaignID", "campaignid", "campaignKey"];
+    const leadKeys = [
+      "leadId", "lead_id", "lead", "leadKey", "lead_key",
+      "contactId", "contact_id",
+      "prospectId", "prospect_id",
+      "personId", "person_id",
+      "recordId", "record_id",
+    ];
+
+    const tryCreate = async (lid: string): Promise<"ok" | "dup" | "fail"> => {
+      for (const ck of campaignKeys) {
+        for (const lk of leadKeys) {
+          try {
+            await join.create({ [ck]: campaignId, [lk]: lid });
+            return "ok";
+          } catch (e) {
+            if (isDup(e)) return "dup";
+            // keep trying other shapes
+          }
         }
       }
       if (typeof join.upsert === "function") {
@@ -176,29 +194,57 @@ export const handler: Handler = async (event) => {
     };
 
     for (const lid of Array.from(new Set(leadIds))) {
-      const r = await attachOne(lid);
+      const r = await tryCreate(lid);
       if (r === "ok") inserted++;
       else if (r === "dup") skipped++;
     }
 
-    return json(200, { inserted, skipped } as AttachResult);
-  }
-
-  // Last resort: stamp campaignId directly on leads table
-  if (leadsTbl) {
-    for (const lid of Array.from(new Set(leadIds))) {
-      try {
-        if (typeof leadsTbl.update === "function") await leadsTbl.update(lid, { campaignId });
-        else if (typeof leadsTbl.patch === "function") await leadsTbl.patch(lid, { campaignId });
-        else if (typeof leadsTbl.upsert === "function")
-          await leadsTbl.upsert({ where: { id: lid }, update: { campaignId }, create: { id: lid, campaignId } });
-        inserted++;
-      } catch (e) {
-        if (isDup(e)) skipped++;
-      }
+    if (inserted > 0 || skipped > 0) {
+      return json(200, { inserted, skipped, debug: { joinKey, leadsKey, dbKeys } } as AttachResult);
     }
-    return json(200, { inserted, skipped } as AttachResult);
   }
 
-  return json(500, { error: "Join table and leads table not found" });
+  // 2) Stamp campaign on leads if join doesn't work
+  if (leadsKey) {
+    const leadsTbl: any = db[leadsKey];
+    const campaignFieldCandidates = ["campaignId", "campaign_id", "campaign", "campaignKey"];
+
+    const updateOne = async (lid: string): Promise<"ok" | "dup" | "fail"> => {
+      for (const f of campaignFieldCandidates) {
+        const patch = { [f]: campaignId };
+        try {
+          if (typeof leadsTbl.update === "function") { await leadsTbl.update(lid, patch); return "ok"; }
+          if (typeof leadsTbl.patch === "function")  { await leadsTbl.patch(lid, patch);  return "ok"; }
+          if (typeof leadsTbl.upsert === "function") {
+            await leadsTbl.upsert({ where: { id: lid }, update: patch, create: { id: lid, ...patch } });
+            return "ok";
+          }
+        } catch (e) {
+          if (isDup(e)) return "dup";
+        }
+      }
+      return "fail";
+    };
+
+    for (const lid of Array.from(new Set(leadIds))) {
+      const r = await updateOne(lid);
+      if (r === "ok") inserted++;
+      else if (r === "dup") skipped++;
+    }
+
+    return json(200, {
+      inserted,
+      skipped,
+      reason: inserted === 0 && skipped === 0 ? "Leads table present but no compatible campaign field" : undefined,
+      debug: { joinKey, leadsKey, dbKeys },
+    } as AttachResult);
+  }
+
+  // 3) Nothing matched — return debug so we can tune quickly
+  return json(200, {
+    inserted: 0,
+    skipped: 0,
+    reason: "No suitable join table or leads table discovered",
+    debug: { joinKey, leadsKey, dbKeys },
+  } as AttachResult);
 };
