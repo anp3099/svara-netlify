@@ -1,3 +1,9 @@
+[[redirects]]
+  from   = "/api/campaigns/:id/leads"
+  to     = "/.netlify/functions/campaigns/:id/leads"
+  status = 200
+  force  = true
+
 [build]
   command = "npm run build"
   publish  = "dist"
