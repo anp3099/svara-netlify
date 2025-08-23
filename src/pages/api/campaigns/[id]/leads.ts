@@ -1,26 +1,34 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 
-// Try both common exports; keep the one your app has.
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore
-import { blink as blinkClient } from "@/blink/client";
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore
-import blinkDefault from "@/lib/blink";
+// ---- Get a server-side Blink handle (tries both common locations) ----
+function getBlink(): any {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require("@/lib/blink");
+    return mod.default ?? mod.blink ?? mod;
+  } catch {}
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require("@/blink/client");
+    return mod.blink ?? mod.default ?? mod;
+  } catch {}
+  return (globalThis as any).blink ?? null;
+}
 
-const blink: any = (blinkClient ?? blinkDefault);
-
+type AttachResult = { inserted: number; skipped: number };
 const isDup = (e: any) =>
   /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
 
-type AttachResult = { inserted: number; skipped: number };
-
-function findTable(db: any, pattern: RegExp, needs: Array<"create"|"update"|"upsert"|"patch">) {
+function findTable(
+  db: any,
+  pattern: RegExp,
+  needs: Array<"create" | "update" | "upsert" | "patch">
+) {
   const keys = Object.keys(db || {});
   for (const k of keys) {
     if (!pattern.test(k)) continue;
     const t = db[k];
-    if (needs.some((m) => typeof t?.[m] === "function")) return { key: k, table: t };
+    if (needs.some((m) => typeof t?.[m] === "function")) return t;
   }
   return null;
 }
@@ -28,115 +36,114 @@ function findTable(db: any, pattern: RegExp, needs: Array<"create"|"update"|"ups
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  try {
-    const campaignId = String(req.query.id || "");
-    const leadIds = Array.isArray(req.body?.leadIds) ? req.body.leadIds.filter(Boolean) : [];
-    if (!campaignId || leadIds.length === 0)
-      return res.status(400).json({ error: "campaignId (path) and leadIds[] (body) required" });
-
-    const db: any = blink?.db;
-    if (!db) return res.status(500).json({ error: "DB unavailable on server" });
-
-    // 1) Find join + leads tables
-    const joinHit =
-      findTable(db, /campaign.*lead|lead.*campaign|^campaign[_]?leads?$/i, ["create", "upsert"]);
-    const leadsHit =
-      findTable(db, /^leads?$|prospect|contact|people|persons|records/i, ["create", "update", "upsert", "patch"]);
-
-    // 2) Ensure leads exist (FK-safe). Minimal upsert/create by id.
-    if (leadsHit) {
-      const me = await blink.auth?.me?.().catch(() => null);
-      for (const lid of Array.from(new Set(leadIds))) {
-        const shapes = [
-          { id: lid, userId: me?.id },
-          { id: lid, user_id: me?.id },
-          { id: lid }, // minimal
-        ];
-        let ok = false;
-        for (const s of shapes) {
-          try {
-            if (typeof leadsHit.table.upsert === "function") {
-              await leadsHit.table.upsert({ where: { id: lid }, update: {}, create: s });
-              ok = true; break;
-            }
-            if (typeof leadsHit.table.create === "function") {
-              await leadsHit.table.create(s);
-              ok = true; break;
-            }
-          } catch (e) {
-            if (isDup(e)) { ok = true; break; }
-          }
-        }
-      }
-    }
-
-    // 3) Insert into the join table if present
-    let inserted = 0, skipped = 0;
-
-    if (joinHit) {
-      const join = joinHit.table;
-      const tryJoinInsert = async (lid: string): Promise<"ok"|"dup"|"fail"> => {
-        const shapes = [
-          { campaignId, leadId: lid },
-          { campaign_id: campaignId, lead_id: lid },
-          { campaign: campaignId, lead: lid },
-        ];
-        for (const s of shapes) {
-          try {
-            await join.create(s);
-            return "ok";
-          } catch (e) {
-            if (isDup(e)) return "dup";
-          }
-        }
-        if (typeof join.upsert === "function") {
-          try {
-            await join.upsert({
-              where: { campaignId_leadId: { campaignId, leadId: lid } },
-              update: {},
-              create: { campaignId, leadId: lid },
-            });
-            return "ok";
-          } catch (e) {
-            if (isDup(e)) return "dup";
-          }
-        }
-        return "fail";
-      };
-
-      for (const lid of Array.from(new Set(leadIds))) {
-        const r = await tryJoinInsert(lid);
-        if (r === "ok") inserted++;
-        else if (r === "dup") skipped++;
-      }
-
-      return res.status(200).json({ inserted, skipped } as AttachResult);
-    }
-
-    // 4) No join table: last resort — set campaignId on the lead rows directly
-    if (leadsHit) {
-      for (const lid of Array.from(new Set(leadIds))) {
-        try {
-          if (typeof leadsHit.table.update === "function") {
-            await leadsHit.table.update(lid, { campaignId });
-          } else if (typeof leadsHit.table.patch === "function") {
-            await leadsHit.table.patch(lid, { campaignId });
-          } else if (typeof leadsHit.table.upsert === "function") {
-            await leadsHit.table.upsert({ where: { id: lid }, update: { campaignId }, create: { id: lid, campaignId } });
-          } else {
-            throw new Error("No update* method on leads table");
-          }
-          inserted++;
-        } catch (e) {
-          if (isDup(e)) skipped++;
-        }
-      }
-      return res.status(200).json({ inserted, skipped } as AttachResult);
-    }
-
-    // 5) Truly nothing to write to
-    return res.status(500).json({ error: "Join table and leads table not found" });
-  } catch (e: any) {
-    return res.status(500).json({ error: String(e?.message || e) });
+  const campaignId = String(req.query.id || "");
+  const leadIds = Array.isArray(req.body?.leadIds) ? req.body.leadIds.filter(Boolean) : [];
+  if (!campaignId || !leadIds.length) {
+    return res
+      .status(400)
+      .json({ error: "campaignId (path) and leadIds[] (body) required" });
   }
+
+  const blink = getBlink();
+  const db: any = blink?.db;
+  if (!db) return res.status(500).json({ error: "DB unavailable on server" });
+
+  // Find join table and leads table
+  const join = findTable(db, /campaign.*lead|lead.*campaign|^campaign[_]?leads?$/i, [
+    "create",
+    "upsert",
+  ]);
+  const leadsTbl = findTable(
+    db,
+    /^leads?$|prospect|contact|people|persons|records/i,
+    ["create", "update", "upsert", "patch"]
+  );
+
+  // Ensure leads exist to satisfy FKs
+  if (leadsTbl) {
+    const me = await blink.auth?.me?.().catch(() => null);
+    for (const id of Array.from(new Set(leadIds))) {
+      const shapes = [{ id, userId: me?.id }, { id, user_id: me?.id }, { id }];
+      for (const s of shapes) {
+        try {
+          if (typeof leadsTbl.upsert === "function") {
+            await leadsTbl.upsert({ where: { id }, update: {}, create: s });
+            break;
+          }
+          if (typeof leadsTbl.create === "function") {
+            await leadsTbl.create(s);
+            break;
+          }
+        } catch (e) {
+          if (isDup(e)) break;
+        }
+      }
+    }
+  }
+
+  // Try join table first
+  let inserted = 0,
+    skipped = 0;
+
+  if (join) {
+    const tryJoin = async (leadId: string): Promise<"ok" | "dup" | "fail"> => {
+      const shapes = [
+        { campaignId, leadId },
+        { campaign_id: campaignId, lead_id: leadId },
+        { campaign: campaignId, lead: leadId },
+      ];
+      for (const s of shapes) {
+        try {
+          await join.create(s);
+          return "ok";
+        } catch (e) {
+          if (isDup(e)) return "dup";
+        }
+      }
+      if (typeof join.upsert === "function") {
+        try {
+          await join.upsert({
+            where: { campaignId_leadId: { campaignId, leadId } },
+            update: {},
+            create: { campaignId, leadId },
+          });
+          return "ok";
+        } catch (e) {
+          if (isDup(e)) return "dup";
+        }
+      }
+      return "fail";
+    };
+
+    for (const id of Array.from(new Set(leadIds))) {
+      const r = await tryJoin(id);
+      if (r === "ok") inserted++;
+      else if (r === "dup") skipped++;
+    }
+    return res.status(200).json({ inserted, skipped } as AttachResult);
+  }
+
+  // No join table → last resort: stamp campaignId on leads
+  if (leadsTbl) {
+    for (const id of Array.from(new Set(leadIds))) {
+      try {
+        if (typeof leadsTbl.update === "function") await leadsTbl.update(id, { campaignId });
+        else if (typeof leadsTbl.patch === "function") await leadsTbl.patch(id, { campaignId });
+        else if (typeof leadsTbl.upsert === "function")
+          await leadsTbl.upsert({
+            where: { id },
+            update: { campaignId },
+            create: { id, campaignId },
+          });
+        inserted++;
+      } catch (e) {
+        if (isDup(e)) skipped++;
+      }
+    }
+    return res.status(200).json({ inserted, skipped } as AttachResult);
+  }
+
+  return res
+    .status(500)
+    .json({ error: "Join table and leads table not found" });
 }
