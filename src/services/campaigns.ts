@@ -42,7 +42,7 @@ async function httpJSON<T = any>(url: string, body?: any): Promise<T | null> {
   }
 }
 
-export const campaignsService = {
+const campaignsService = {
   // List via DB; if blink missing, return []
   async list(userId?: string): Promise<CampaignRow[]> {
     try {
@@ -89,7 +89,7 @@ export const campaignsService = {
     const ids = Array.from(new Set(leadIds)).filter(Boolean);
     if (!campaignId || ids.length === 0) return { inserted: 0, skipped: 0 };
 
-    // 1) Netlify function (canonical)
+    // 1) Netlify function (canonical) then other API paths
     const apiOrder = [
       `/.netlify/functions/campaigns?id=${encodeURIComponent(campaignId)}`,
       `/api/campaigns/${encodeURIComponent(campaignId)}/leads`,
