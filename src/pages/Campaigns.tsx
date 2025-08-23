@@ -1,164 +1,100 @@
 // src/pages/Campaigns.tsx
 import React, { useEffect, useState } from "react";
 import {
-  Plus,
-  Search,
-  Filter,
-  MoreHorizontal,
-  Play,
-  Pause,
-  BarChart3,
-  Users,
-  Mail,
-  MessageSquare,
+  Plus, Search, Filter, MoreHorizontal, Play, Pause, BarChart3, Users, Mail, MessageSquare
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { blink } from "@/blink/client";
-import { planRestrictionService } from "@/services/planRestrictions";
-import campaignService from "@/services/campaigns";
+import { campaignsService } from "@/services/campaigns";
 
-interface Campaign {
+type Campaign = {
   id: string;
+  userId: string;
+  productId?: string | null;
   name: string;
   description: string;
-  status: string;
+  status: "draft" | "active" | "paused" | "completed";
   totalLeads: number;
   contactedLeads: number;
   responses: number;
   conversions: number;
   createdAt: string;
+};
 
-  // compatibility fields coming from DB (snake_case)
-  total_leads?: number;
-  contacted_leads?: number;
-  created_at?: string;
-  productId?: string;
-  product_id?: string;
-}
+type Product = { id: string; name: string };
 
-interface Product {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-}
-
-export default function Campaigns() {
+export default function CampaignsPage() {
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [newCampaign, setNewCampaign] = useState({
-    name: "",
-    description: "",
-    product_id: "",
-  });
-
-  async function load() {
-    try {
-      setLoading(true);
-      const me = await blink.auth.me();
-
-      const [cs, ps] = await Promise.all([
-        campaignService.list(me.id),
-        blink.db.products.list({ where: { userId: me.id } }),
-      ]);
-
-      const normalized = cs.map((c: any) => ({
-        ...c,
-        totalLeads: c.totalLeads ?? c.total_leads ?? 0,
-        contactedLeads: c.contactedLeads ?? c.contacted_leads ?? 0,
-        createdAt: c.createdAt ?? c.created_at ?? new Date().toISOString(),
-      }));
-
-      setCampaigns(normalized);
-      setProducts(ps);
-    } catch (e) {
-      console.error("Failed to load campaigns/products", e);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const [newCampaign, setNewCampaign] = useState({ name: "", description: "", product_id: "" });
 
   useEffect(() => {
-    load();
+    (async () => {
+      try {
+        setLoading(true);
+        const me = await blink.auth.me();
+
+        const [list, prod] = await Promise.all([
+          campaignsService.list(me.id),
+          (blink as any).db?.products?.list?.({ where: { userId: me.id }, limit: 200 }) ?? [],
+        ]);
+        setCampaigns(list as any);
+        setProducts((prod || []).map((p: any) => ({ id: p.id || p.key, name: p.name })));
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, []);
 
-  async function createCampaign() {
-    if (!newCampaign.name.trim()) return alert("Please enter a campaign name");
-    if (!newCampaign.product_id) return alert("Please select a product");
+  const createCampaign = async () => {
+    if (!newCampaign.name.trim()) return alert("Enter a name");
+    if (!newCampaign.product_id) return alert("Pick a product");
+    const me = await blink.auth.me();
 
-    try {
-      const me = await blink.auth.me();
+    const created = await campaignsService.create({
+      userId: me.id,
+      name: newCampaign.name.trim(),
+      description: newCampaign.description.trim(),
+      productId: newCampaign.product_id,
+    });
 
-      const plan = await planRestrictionService.canCreateCampaign(me.id);
-      if (!plan.allowed) return alert(plan.message || "Campaign limit reached.");
+    // If duplicate, created._existing is true — still show it in the grid
+    setCampaigns((prev) => [{ ...(created as any), status: created.status || "draft", totalLeads: 0, contactedLeads: 0, responses: 0, conversions: 0, createdAt: created.createdAt || new Date().toISOString() }, ...prev.filter(c => c.id !== (created as any).id)]);
+    setIsCreateDialogOpen(false);
+    setNewCampaign({ name: "", description: "", product_id: "" });
+  };
 
-      const created = await campaignService.create({
-        userId: me.id,
-        name: newCampaign.name,
-        description: newCampaign.description,
-        productId: newCampaign.product_id,
-      });
-
-      setCampaigns((p) => [
-        {
-          ...created,
-          createdAt: new Date().toISOString(),
-          totalLeads: 0,
-          contactedLeads: 0,
-          responses: 0,
-          conversions: 0,
-        },
-        ...p,
-      ]);
-
-      setIsCreateDialogOpen(false);
-      setNewCampaign({ name: "", description: "", product_id: "" });
-      alert("Campaign created!");
-    } catch (e: any) {
-      console.error(e);
-      alert(`Failed to create campaign: ${e?.message || "Unknown error"}`);
-    }
-  }
-
-  function toggleStatus(id: string, status: string) {
+  const toggleStatus = (id: string, status: Campaign["status"]) => {
     const next = status === "active" ? "paused" : "active";
     setCampaigns((p) => p.map((c) => (c.id === id ? { ...c, status: next } : c)));
-    // NOTE: add blink.db.campaigns.update call if you persist status server-side
-  }
+  };
+
+  const getStatusBadge = (status: string) => {
+    const map: Record<string, { label: string; variant: any }> = {
+      draft: { label: "Draft", variant: "secondary" },
+      active: { label: "Active", variant: "default" },
+      paused: { label: "Paused", variant: "outline" },
+      completed: { label: "Completed", variant: "destructive" },
+    };
+    const cfg = map[status] || map.draft;
+    return <Badge variant={cfg.variant as any}>{cfg.label}</Badge>;
+  };
 
   const filtered = campaigns.filter(
     (c) =>
       c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      c.description?.toLowerCase().includes(searchTerm.toLowerCase())
+      c.description?.toLowerCase().includes(searchTerm.toLowerCase()),
   );
 
   if (loading) {
@@ -170,11 +106,7 @@ export default function Campaigns() {
             <p className="text-gray-600 mt-1">Loading campaigns…</p>
           </div>
         </div>
-        <div className="grid gap-6">
-          {[...Array(3)].map((_, i) => (
-            <div key={i} className="h-48 bg-gray-200 rounded-lg animate-pulse" />
-          ))}
-        </div>
+        <div className="grid gap-6">{[...Array(3)].map((_, i) => <div key={i} className="h-48 bg-gray-200 rounded-lg animate-pulse" />)}</div>
       </div>
     );
   }
@@ -198,117 +130,77 @@ export default function Campaigns() {
           <DialogContent className="max-w-2xl">
             <DialogHeader>
               <DialogTitle>Create New Campaign</DialogTitle>
-              <DialogDescription>Give your campaign a name and pick a product.</DialogDescription>
+              <DialogDescription>Link a product, then create the campaign.</DialogDescription>
             </DialogHeader>
-
-            <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Campaign Name</Label>
+                  <Input
+                    value={newCampaign.name}
+                    onChange={(e) => setNewCampaign((p) => ({ ...p, name: e.target.value }))}
+                    placeholder="Q4 Outreach"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Product</Label>
+                  <Select value={newCampaign.product_id} onValueChange={(v) => setNewCampaign((p) => ({ ...p, product_id: v }))}>
+                    <SelectTrigger><SelectValue placeholder="Select product" /></SelectTrigger>
+                    <SelectContent>
+                      {products.length ? (
+                        products.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)
+                      ) : (
+                        <SelectItem value="no" disabled>No products found</SelectItem>
+                      )}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
               <div className="space-y-2">
-                <Label>Campaign Name</Label>
-                <Input
-                  placeholder="Q4 Outreach"
-                  value={newCampaign.name}
-                  onChange={(e) => setNewCampaign((p) => ({ ...p, name: e.target.value }))}
+                <Label>Description</Label>
+                <Textarea
+                  value={newCampaign.description}
+                  onChange={(e) => setNewCampaign((p) => ({ ...p, description: e.target.value }))}
+                  placeholder="Describe goals and target…"
                 />
               </div>
-              <div className="space-y-2">
-                <Label>Product</Label>
-                <Select
-                  value={newCampaign.product_id}
-                  onValueChange={(v) => setNewCampaign((p) => ({ ...p, product_id: v }))}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select product" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {products.length ? (
-                      products.map((prd) => (
-                        <SelectItem key={prd.id} value={prd.id}>
-                          {prd.name}
-                        </SelectItem>
-                      ))
-                    ) : (
-                      <SelectItem value="none" disabled>
-                        No products yet
-                      </SelectItem>
-                    )}
-                  </SelectContent>
-                </Select>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>Cancel</Button>
+                <Button onClick={createCampaign} disabled={!newCampaign.name || !newCampaign.product_id}>Create Campaign</Button>
               </div>
-            </div>
-
-            <div className="space-y-2">
-              <Label>Description</Label>
-              <Textarea
-                placeholder="Describe your campaign goals…"
-                value={newCampaign.description}
-                onChange={(e) =>
-                  setNewCampaign((p) => ({ ...p, description: e.target.value }))
-                }
-              />
-            </div>
-
-            <div className="flex justify-end gap-2">
-              <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>
-                Cancel
-              </Button>
-              <Button onClick={createCampaign} disabled={!newCampaign.name || !newCampaign.product_id}>
-                Create Campaign
-              </Button>
             </div>
           </DialogContent>
         </Dialog>
       </div>
 
-      {/* Search */}
+      {/* Controls */}
       <div className="flex items-center gap-4">
         <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
-          <Input
-            className="pl-10"
-            placeholder="Search campaigns…"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-          />
+          <Input className="pl-10" placeholder="Search campaigns…" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
         </div>
-        <Button variant="outline">
-          <Filter className="w-4 h-4 mr-2" />
-          Filter
-        </Button>
+        <Button variant="outline"><Filter className="w-4 h-4 mr-2" />Filter</Button>
       </div>
 
       {/* Grid */}
       <div className="grid gap-6">
         {filtered.map((c) => (
           <Card key={c.id} className="hover:shadow-lg transition-shadow">
-            <CardHeader className="flex items-center justify-between space-y-0 pb-4">
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-4">
               <div className="flex-1">
                 <div className="flex items-center gap-3">
                   <CardTitle className="text-xl">{c.name}</CardTitle>
-                  <Badge variant={c.status === "active" ? "default" : c.status === "paused" ? "outline" : "secondary"}>
-                    {c.status ?? "draft"}
-                  </Badge>
+                  {getStatusBadge(c.status)}
                 </div>
-                <CardDescription className="mt-1">{c.description || "No description provided"}</CardDescription>
+                <CardDescription className="mt-1">{c.description || "No description"}</CardDescription>
               </div>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm">
-                    <MoreHorizontal className="w-4 h-4" />
-                  </Button>
+                  <Button variant="ghost" size="sm"><MoreHorizontal className="w-4 h-4" /></Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem onClick={() => toggleStatus(c.id, c.status)}>
-                    {c.status === "active" ? (
-                      <>
-                        <Pause className="w-4 h-4 mr-2" />
-                        Pause Campaign
-                      </>
-                    ) : (
-                      <>
-                        <Play className="w-4 h-4 mr-2" />
-                        Launch Campaign
-                      </>
-                    )}
+                    {c.status === "active" ? (<><Pause className="w-4 h-4 mr-2" />Pause</>) : (<><Play className="w-4 h-4 mr-2" />Launch</>)}
                   </DropdownMenuItem>
                   <DropdownMenuItem>
                     <BarChart3 className="w-4 h-4 mr-2" />
@@ -317,13 +209,12 @@ export default function Campaigns() {
                 </DropdownMenuContent>
               </DropdownMenu>
             </CardHeader>
-
             <CardContent>
               <div className="grid grid-cols-4 gap-4">
-                <Stat icon={<Users className="w-5 h-5 text-blue-600" />} label="Total Leads" value={c.totalLeads} badgeClass="bg-blue-100" />
-                <Stat icon={<Mail className="w-5 h-5 text-green-600" />} label="Contacted" value={c.contactedLeads} badgeClass="bg-green-100" />
-                <Stat icon={<MessageSquare className="w-5 h-5 text-amber-600" />} label="Responses" value={c.responses} badgeClass="bg-amber-100" />
-                <Stat icon={<BarChart3 className="w-5 h-5 text-purple-600" />} label="Conversions" value={c.conversions} badgeClass="bg-purple-100" />
+                <Stat icon={<Users className="w-5 h-5 text-blue-600" />} label="Total Leads" value={c.totalLeads} bg="bg-blue-100" />
+                <Stat icon={<Mail className="w-5 h-5 text-green-600" />} label="Contacted" value={c.contactedLeads} bg="bg-green-100" />
+                <Stat icon={<MessageSquare className="w-5 h-5 text-amber-600" />} label="Responses" value={c.responses} bg="bg-amber-100" />
+                <Stat icon={<BarChart3 className="w-5 h-5 text-purple-600" />} label="Conversions" value={c.conversions} bg="bg-purple-100" />
               </div>
               <div className="mt-4 pt-4 border-t text-sm text-gray-600 flex justify-between">
                 <span>Created {new Date(c.createdAt).toLocaleDateString()}</span>
@@ -339,21 +230,11 @@ export default function Campaigns() {
   );
 }
 
-function Stat({
-  icon,
-  label,
-  value,
-  badgeClass,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: number;
-  badgeClass: string;
-}) {
+function Stat({ icon, label, value, bg }: any) {
   return (
     <div className="text-center">
-      <div className={`flex items-center justify-center w-10 h-10 rounded-full mb-2 mx-auto ${badgeClass}`}>{icon}</div>
-      <div className="text-2xl font-bold text-gray-900">{(value ?? 0).toLocaleString()}</div>
+      <div className={`flex items-center justify-center w-10 h-10 ${bg} rounded-full mb-2 mx-auto`}>{icon}</div>
+      <div className="text-2xl font-bold text-gray-900">{Number(value || 0).toLocaleString()}</div>
       <div className="text-sm text-gray-600">{label}</div>
     </div>
   );
