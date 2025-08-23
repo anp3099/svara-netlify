@@ -60,7 +60,12 @@ function findLeadsTableKey(db: any): string | null {
   ];
   for (const k of preferred) {
     const t = db?.[k];
-    if (t && (typeof t.update === "function" || typeof t.upsert === "function" || typeof t.patch === "function"))
+    if (
+      t &&
+      (typeof t.update === "function" ||
+        typeof t.upsert === "function" ||
+        typeof t.patch === "function")
+    )
       return k;
   }
 
@@ -69,7 +74,11 @@ function findLeadsTableKey(db: any): string | null {
     if (/campaign/i.test(k)) return false;
     if (!/lead|contact|prospect|people|person|record/i.test(k)) return false;
     const t = db?.[k];
-    return typeof t?.update === "function" || typeof t?.upsert === "function" || typeof t?.patch === "function";
+    return (
+      typeof t?.update === "function" ||
+      typeof t?.upsert === "function" ||
+      typeof t?.patch === "function"
+    );
   });
 
   return discovered ?? null;
@@ -115,22 +124,61 @@ function extractCampaignId(event: any, body: any): string | null {
 
 /* -------------------------------- handler ------------------------------ */
 export const handler: Handler = async (event) => {
-  // Health check
+  // Health check + optional debug table listing
   if (event.httpMethod === "GET") {
-    return json(200, { ok: true, path: event.path, rawUrl: (event as any).rawUrl ?? null });
+    const debugWanted =
+      event.queryStringParameters?.debug === "1" ||
+      event.queryStringParameters?.debug === "true";
+
+    if (!debugWanted) {
+      return json(200, {
+        ok: true,
+        path: event.path,
+        rawUrl: (event as any).rawUrl ?? null,
+      });
+    }
+
+    const blink = getBlink();
+    const db: any = blink?.db ?? {};
+    const keys = Object.keys(db);
+    const tables = keys.map((k) => ({
+      name: k,
+      has: {
+        create: typeof db[k]?.create === "function",
+        update: typeof db[k]?.update === "function",
+        upsert: typeof db[k]?.upsert === "function",
+        patch: typeof db[k]?.patch === "function",
+        list: typeof db[k]?.list === "function",
+      },
+    }));
+    return json(200, { ok: true, tables });
   }
+
   if (event.httpMethod !== "POST") return json(405, { error: "Method not allowed" });
 
-  const body = (() => { try { return JSON.parse(event.body || "{}"); } catch { return {}; } })();
+  const body = (() => {
+    try {
+      return JSON.parse(event.body || "{}");
+    } catch {
+      return {};
+    }
+  })();
   const campaignId = extractCampaignId(event, body);
-  const leadIds: string[] = Array.isArray(body?.leadIds) ? body.leadIds.filter(Boolean) : [];
+  const leadIds: string[] = Array.isArray(body?.leadIds)
+    ? body.leadIds.filter(Boolean)
+    : [];
 
   if (!campaignId) return json(400, { error: "campaignId missing" });
   if (!leadIds.length) return json(400, { error: "leadIds[] required" });
 
   const blink = getBlink();
   const db: any = blink?.db;
-  if (!db) return json(200, { inserted: 0, skipped: 0, reason: "DB unavailable on server" } as AttachResult);
+  if (!db)
+    return json(200, {
+      inserted: 0,
+      skipped: 0,
+      reason: "DB unavailable on server",
+    } as AttachResult);
 
   const dbKeys = keysOf(db);
   const joinKey = findJoinTableKey(db);
@@ -141,29 +189,61 @@ export const handler: Handler = async (event) => {
     const leadsTbl: any = db[leadsKey];
     const me = await blink.auth?.me?.().catch(() => null);
     for (const lid of Array.from(new Set(leadIds))) {
-      const candidates = [{ id: lid, userId: me?.id }, { id: lid, user_id: me?.id }, { id: lid }];
+      const candidates = [
+        { id: lid, userId: me?.id },
+        { id: lid, user_id: me?.id },
+        { id: lid },
+      ];
       for (const c of candidates) {
         try {
-          if (typeof leadsTbl.upsert === "function") { await leadsTbl.upsert({ where: { id: lid }, update: {}, create: c }); break; }
-          if (typeof leadsTbl.create === "function") { await leadsTbl.create(c); break; }
-        } catch (e) { if (isDup(e)) break; }
+          if (typeof leadsTbl.upsert === "function") {
+            await leadsTbl.upsert({
+              where: { id: lid },
+              update: {},
+              create: c,
+            });
+            break;
+          }
+          if (typeof leadsTbl.create === "function") {
+            await leadsTbl.create(c);
+            break;
+          }
+        } catch (e) {
+          if (isDup(e)) break;
+        }
       }
     }
   }
 
-  let inserted = 0, skipped = 0;
+  let inserted = 0,
+    skipped = 0;
 
   // 1) Join table path (most correct)
   if (joinKey) {
     const join = db[joinKey];
 
-    const campaignKeys = ["campaignId", "campaign_id", "campaign", "campaignID", "campaignid", "campaignKey"];
+    const campaignKeys = [
+      "campaignId",
+      "campaign_id",
+      "campaign",
+      "campaignID",
+      "campaignid",
+      "campaignKey",
+    ];
     const leadKeys = [
-      "leadId", "lead_id", "lead", "leadKey", "lead_key",
-      "contactId", "contact_id",
-      "prospectId", "prospect_id",
-      "personId", "person_id",
-      "recordId", "record_id",
+      "leadId",
+      "lead_id",
+      "lead",
+      "leadKey",
+      "lead_key",
+      "contactId",
+      "contact_id",
+      "prospectId",
+      "prospect_id",
+      "personId",
+      "person_id",
+      "recordId",
+      "record_id",
     ];
 
     const tryCreate = async (lid: string): Promise<"ok" | "dup" | "fail"> => {
@@ -200,23 +280,42 @@ export const handler: Handler = async (event) => {
     }
 
     if (inserted > 0 || skipped > 0) {
-      return json(200, { inserted, skipped, debug: { joinKey, leadsKey, dbKeys } } as AttachResult);
+      return json(200, {
+        inserted,
+        skipped,
+        debug: { joinKey, leadsKey, dbKeys },
+      } as AttachResult);
     }
   }
 
   // 2) Stamp campaign on leads if join doesn't work
   if (leadsKey) {
     const leadsTbl: any = db[leadsKey];
-    const campaignFieldCandidates = ["campaignId", "campaign_id", "campaign", "campaignKey"];
+    const campaignFieldCandidates = [
+      "campaignId",
+      "campaign_id",
+      "campaign",
+      "campaignKey",
+    ];
 
     const updateOne = async (lid: string): Promise<"ok" | "dup" | "fail"> => {
       for (const f of campaignFieldCandidates) {
         const patch = { [f]: campaignId };
         try {
-          if (typeof leadsTbl.update === "function") { await leadsTbl.update(lid, patch); return "ok"; }
-          if (typeof leadsTbl.patch === "function")  { await leadsTbl.patch(lid, patch);  return "ok"; }
+          if (typeof leadsTbl.update === "function") {
+            await leadsTbl.update(lid, patch);
+            return "ok";
+          }
+          if (typeof leadsTbl.patch === "function") {
+            await leadsTbl.patch(lid, patch);
+            return "ok";
+          }
           if (typeof leadsTbl.upsert === "function") {
-            await leadsTbl.upsert({ where: { id: lid }, update: patch, create: { id: lid, ...patch } });
+            await leadsTbl.upsert({
+              where: { id: lid },
+              update: patch,
+              create: { id: lid, ...patch },
+            });
             return "ok";
           }
         } catch (e) {
@@ -235,7 +334,10 @@ export const handler: Handler = async (event) => {
     return json(200, {
       inserted,
       skipped,
-      reason: inserted === 0 && skipped === 0 ? "Leads table present but no compatible campaign field" : undefined,
+      reason:
+        inserted === 0 && skipped === 0
+          ? "Leads table present but no compatible campaign field"
+          : undefined,
       debug: { joinKey, leadsKey, dbKeys },
     } as AttachResult);
   }
