@@ -1,7 +1,18 @@
 // netlify/functions/campaigns.ts
 import type { Handler } from "@netlify/functions";
 
+/* ------------------------------- helpers ------------------------------- */
+
+const JSON_HEADERS = { "Content-Type": "application/json" };
+
+const json = (code: number, body: unknown) => ({
+  statusCode: code,
+  headers: JSON_HEADERS,
+  body: JSON.stringify(body),
+});
+
 type AttachResult = { inserted: number; skipped: number };
+
 const isDup = (e: any) =>
   /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
 
@@ -19,71 +30,146 @@ function findTable(
   return null;
 }
 
-// Try a few places to import your server-side Blink handle.
+/** Try several common exports/paths to obtain a server-side Blink handle. */
 function getBlink(): any {
-  try { const m = require("../../src/lib/blink"); return m.default ?? m.blink ?? m; } catch {}
-  try { const m = require("../../lib/blink");     return m.default ?? m.blink ?? m; } catch {}
-  try { const m = require("@/lib/blink");        return m.default ?? m.blink ?? m; } catch {}
-  try { const m = require("@/blink/client");     return m.blink ?? m.default ?? m; } catch {}
-  return null;
+  // If you already have a utils helper, prefer that:
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const u = require("./_utils");
+    if (typeof u.getBlink === "function") {
+      const b = u.getBlink();
+      if (b) return b;
+    }
+  } catch {}
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const m = require("../../src/lib/blink");
+    return m.default ?? m.blink ?? m;
+  } catch {}
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const m = require("../../lib/blink");
+    return m.default ?? m.blink ?? m;
+  } catch {}
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const m = require("@/lib/blink");
+    return m.default ?? m.blink ?? m;
+  } catch {}
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const m = require("@/blink/client");
+    return m.blink ?? m.default ?? m;
+  } catch {}
+  return (globalThis as any).blink ?? null;
 }
 
+/** Extract campaignId from query/body and any path info Netlify preserves. */
+function extractCampaignId(event: any, body: any): string | null {
+  // 1) Query (?id=...)
+  let id = event?.queryStringParameters?.id || body?.campaignId || "";
+
+  // 2) Try to pull from any path-like string Netlify exposes
+  const pathBits = [
+    event?.path || "",
+    event?.rawUrl || "",
+    event?.headers?.["x-nf-original-pathname"] || "",
+    event?.headers?.["x-original-uri"] || "",
+  ].join(" ");
+
+  const m =
+    pathBits.match(/\/campaigns\/([^/]+)\/leads\/?(\?|$)/i) ||
+    pathBits.match(/\/api\/campaigns\/([^/]+)\/leads\/?(\?|$)/i);
+
+  if (!id && m) id = m[1];
+  return id || null;
+}
+
+/* -------------------------------- handler ------------------------------ */
+
 export const handler: Handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: JSON.stringify({ error: "Method not allowed" }) };
+  // Simple GET health for quick verification
+  if (event.httpMethod === "GET") {
+    return json(200, { ok: true, path: event.path, rawUrl: (event as any).rawUrl ?? null });
   }
 
-  // Because of your redirect, the function is invoked as:
-  // /.netlify/functions/campaigns/<id>/leads
-  // We also support query ?id=... just in case.
-  const path = event.path || "";
-  const segMatch = path.match(/\/campaigns\/([^/]+)\/leads\/?$/);
-  const idFromPath = segMatch?.[1];
-  const idFromQuery = event.queryStringParameters?.id;
-  const campaignId = String(idFromPath || idFromQuery || "");
+  if (event.httpMethod !== "POST") {
+    return json(405, { error: "Method not allowed" });
+  }
 
-  const body = (() => { try { return JSON.parse(event.body || "{}"); } catch { return {}; } })();
+  // Parse body safely
+  const body = (() => {
+    try {
+      return JSON.parse(event.body || "{}");
+    } catch {
+      return {};
+    }
+  })();
+
+  // campaignId & leadIds
+  const campaignId = extractCampaignId(event, body);
   const leadIds: string[] = Array.isArray(body?.leadIds) ? body.leadIds.filter(Boolean) : [];
 
-  if (!campaignId || !leadIds.length) {
-    return { statusCode: 400, body: JSON.stringify({ error: "campaignId and leadIds[] required" }) };
-  }
+  if (!campaignId) return json(400, { error: "campaignId missing" });
+  if (!leadIds.length) return json(400, { error: "leadIds[] required" });
 
+  // Acquire DB
   const blink = getBlink();
   const db: any = blink?.db;
-  if (!db) return { statusCode: 500, body: JSON.stringify({ error: "DB unavailable on server" }) };
+  if (!db) return json(500, { error: "DB unavailable on server" });
 
-  // Find tables
-  const join = findTable(db, /campaign.*lead|lead.*campaign|^campaign[_]?leads?$/i, ["create","upsert"]);
-  const leadsTbl = findTable(db, /^leads?$|prospect|contact|people|persons|records/i, ["create","update","upsert","patch"]);
+  // Discover tables
+  const join = findTable(
+    db,
+    /campaign.*lead|lead.*campaign|^campaign[_]?leads?$/i,
+    ["create", "upsert"]
+  );
+  const leadsTbl = findTable(
+    db,
+    /^leads?$|prospect|contact|people|persons|records/i,
+    ["create", "update", "upsert", "patch"]
+  );
 
-  // Ensure leads exist (FK-safe)
+  // Ensure lead rows exist (to satisfy possible FKs)
   if (leadsTbl) {
     const me = await blink.auth?.me?.().catch(() => null);
     for (const lid of Array.from(new Set(leadIds))) {
-      const shapes = [{ id: lid, userId: me?.id }, { id: lid, user_id: me?.id }, { id: lid }];
-      for (const s of shapes) {
+      const candidates = [{ id: lid, userId: me?.id }, { id: lid, user_id: me?.id }, { id: lid }];
+      for (const c of candidates) {
         try {
-          if (typeof leadsTbl.upsert === "function") { await leadsTbl.upsert({ where: { id: lid }, update: {}, create: s }); break; }
-          if (typeof leadsTbl.create === "function") { await leadsTbl.create(s); break; }
-        } catch (e) { if (isDup(e)) break; }
+          if (typeof leadsTbl.upsert === "function") {
+            await leadsTbl.upsert({ where: { id: lid }, update: {}, create: c });
+            break;
+          }
+          if (typeof leadsTbl.create === "function") {
+            await leadsTbl.create(c);
+            break;
+          }
+        } catch (e) {
+          if (isDup(e)) break; // already exists
+        }
       }
     }
   }
 
-  // Prefer join table
-  let inserted = 0, skipped = 0;
+  // Try join table first
+  let inserted = 0;
+  let skipped = 0;
 
   if (join) {
-    const tryJoin = async (lid: string): Promise<"ok"|"dup"|"fail"> => {
+    const attachOne = async (lid: string): Promise<"ok" | "dup" | "fail"> => {
       const shapes = [
         { campaignId, leadId: lid },
         { campaign_id: campaignId, lead_id: lid },
         { campaign: campaignId, lead: lid },
       ];
       for (const s of shapes) {
-        try { await join.create(s); return "ok"; }
-        catch (e) { if (isDup(e)) return "dup"; }
+        try {
+          await join.create(s);
+          return "ok";
+        } catch (e) {
+          if (isDup(e)) return "dup";
+        }
       }
       if (typeof join.upsert === "function") {
         try {
@@ -93,31 +179,42 @@ export const handler: Handler = async (event) => {
             create: { campaignId, leadId: lid },
           });
           return "ok";
-        } catch (e) { if (isDup(e)) return "dup"; }
+        } catch (e) {
+          if (isDup(e)) return "dup";
+        }
       }
       return "fail";
     };
 
     for (const lid of Array.from(new Set(leadIds))) {
-      const r = await tryJoin(lid);
+      const r = await attachOne(lid);
       if (r === "ok") inserted++;
       else if (r === "dup") skipped++;
     }
-    return { statusCode: 200, body: JSON.stringify({ inserted, skipped } as AttachResult) };
+
+    return json(200, { inserted, skipped } as AttachResult);
   }
 
-  // Last resort: stamp campaignId directly on leads
+  // No join table → last resort: stamp campaignId on leads
   if (leadsTbl) {
     for (const lid of Array.from(new Set(leadIds))) {
       try {
         if (typeof leadsTbl.update === "function") await leadsTbl.update(lid, { campaignId });
         else if (typeof leadsTbl.patch === "function") await leadsTbl.patch(lid, { campaignId });
-        else if (typeof leadsTbl.upsert === "function") await leadsTbl.upsert({ where: { id: lid }, update: { campaignId }, create: { id: lid, campaignId } });
+        else if (typeof leadsTbl.upsert === "function")
+          await leadsTbl.upsert({
+            where: { id: lid },
+            update: { campaignId },
+            create: { id: lid, campaignId },
+          });
         inserted++;
-      } catch (e) { if (isDup(e)) skipped++; }
+      } catch (e) {
+        if (isDup(e)) skipped++;
+      }
     }
-    return { statusCode: 200, body: JSON.stringify({ inserted, skipped } as AttachResult) };
+    return json(200, { inserted, skipped } as AttachResult);
   }
 
-  return { statusCode: 500, body: JSON.stringify({ error: "Join table and leads table not found" }) };
+  // If we get here, we couldn't find any usable table
+  return json(500, { error: "Join table and leads table not found" });
 };
