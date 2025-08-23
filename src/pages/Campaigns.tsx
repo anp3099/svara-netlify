@@ -1,9 +1,10 @@
 // src/pages/Campaigns.tsx
-import campaignsService from "@/services/campaigns";
 import React, { useEffect, useState } from "react";
 import {
-  Plus, Search, Filter, MoreHorizontal, Play, Pause, BarChart3, Users, Mail, MessageSquare
+  Plus, Search, Filter, MoreHorizontal, Play, Pause,
+  BarChart3, Users, Mail, MessageSquare
 } from "lucide-react";
+
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,8 +14,9 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+
 import { blink } from "@/blink/client";
-import { campaignsService } from "@/services/campaigns";
+import { campaignsService, type CampaignRow } from "@/services/campaigns";
 
 type Campaign = {
   id: string;
@@ -44,14 +46,37 @@ export default function CampaignsPage() {
     (async () => {
       try {
         setLoading(true);
-        const me = await blink.auth.me();
 
-        const [list, prod] = await Promise.all([
-          campaignsService.list(me.id),
-          (blink as any).db?.products?.list?.({ where: { userId: me.id }, limit: 200 }) ?? [],
-        ]);
-        setCampaigns(list as any);
-        setProducts((prod || []).map((p: any) => ({ id: p.id || p.key, name: p.name })));
+        const me = await blink.auth.me().catch(() => null);
+
+        // 1) List campaigns (API-first via service), then hydrate counts from server
+        const baseRows: CampaignRow[] = await campaignsService.list();
+        const rowsWithCounts = await campaignsService.hydrateCounts(baseRows);
+
+        // Map to the local Campaign type the UI expects
+        const mapped: Campaign[] = rowsWithCounts.map((r) => ({
+          id: r.id,
+          userId: (me?.id as string) ?? "",
+          productId: (r as any).productId ?? null,
+          name: r.name,
+          description: r.description ?? "",
+          status: ((r as any).status as Campaign["status"]) ?? "draft",
+          totalLeads: r.totalLeads ?? 0,
+          contactedLeads: (r as any).contactedLeads ?? 0,
+          responses: (r as any).responses ?? 0,
+          conversions: (r as any).conversions ?? 0,
+          createdAt: r.createdAt ?? new Date().toISOString(),
+        }));
+
+        // 2) Products (client DB; fine to do on the browser)
+        const prod =
+          (await (blink as any).db?.products?.list?.({
+            where: me?.id ? { userId: me.id } : undefined,
+            limit: 200,
+          })) ?? [];
+
+        setCampaigns(mapped);
+        setProducts(prod.map((p: any) => ({ id: p.id || p.key, name: p.name })));
       } finally {
         setLoading(false);
       }
@@ -70,8 +95,24 @@ export default function CampaignsPage() {
       productId: newCampaign.product_id,
     });
 
-    // If duplicate, created._existing is true — still show it in the grid
-    setCampaigns((prev) => [{ ...(created as any), status: created.status || "draft", totalLeads: 0, contactedLeads: 0, responses: 0, conversions: 0, createdAt: created.createdAt || new Date().toISOString() }, ...prev.filter(c => c.id !== (created as any).id)]);
+    // Add new card optimistically (counts will be 0 until leads are attached)
+    setCampaigns((prev) => [
+      {
+        id: created.id,
+        userId: me.id,
+        productId: newCampaign.product_id,
+        name: created.name,
+        description: newCampaign.description.trim(),
+        status: "draft",
+        totalLeads: 0,
+        contactedLeads: 0,
+        responses: 0,
+        conversions: 0,
+        createdAt: new Date().toISOString(),
+      },
+      ...prev.filter((c) => c.id !== created.id),
+    ]);
+
     setIsCreateDialogOpen(false);
     setNewCampaign({ name: "", description: "", product_id: "" });
   };
@@ -95,7 +136,7 @@ export default function CampaignsPage() {
   const filtered = campaigns.filter(
     (c) =>
       c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      c.description?.toLowerCase().includes(searchTerm.toLowerCase()),
+      c.description?.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
   if (loading) {
@@ -107,7 +148,11 @@ export default function CampaignsPage() {
             <p className="text-gray-600 mt-1">Loading campaigns…</p>
           </div>
         </div>
-        <div className="grid gap-6">{[...Array(3)].map((_, i) => <div key={i} className="h-48 bg-gray-200 rounded-lg animate-pulse" />)}</div>
+        <div className="grid gap-6">
+          {[...Array(3)].map((_, i) => (
+            <div key={i} className="h-48 bg-gray-200 rounded-lg animate-pulse" />
+          ))}
+        </div>
       </div>
     );
   }
@@ -145,13 +190,24 @@ export default function CampaignsPage() {
                 </div>
                 <div className="space-y-2">
                   <Label>Product</Label>
-                  <Select value={newCampaign.product_id} onValueChange={(v) => setNewCampaign((p) => ({ ...p, product_id: v }))}>
-                    <SelectTrigger><SelectValue placeholder="Select product" /></SelectTrigger>
+                  <Select
+                    value={newCampaign.product_id}
+                    onValueChange={(v) => setNewCampaign((p) => ({ ...p, product_id: v }))}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select product" />
+                    </SelectTrigger>
                     <SelectContent>
                       {products.length ? (
-                        products.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)
+                        products.map((p) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.name}
+                          </SelectItem>
+                        ))
                       ) : (
-                        <SelectItem value="no" disabled>No products found</SelectItem>
+                        <SelectItem value="no" disabled>
+                          No products found
+                        </SelectItem>
                       )}
                     </SelectContent>
                   </Select>
@@ -166,8 +222,12 @@ export default function CampaignsPage() {
                 />
               </div>
               <div className="flex justify-end gap-2">
-                <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>Cancel</Button>
-                <Button onClick={createCampaign} disabled={!newCampaign.name || !newCampaign.product_id}>Create Campaign</Button>
+                <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>
+                  Cancel
+                </Button>
+                <Button onClick={createCampaign} disabled={!newCampaign.name || !newCampaign.product_id}>
+                  Create Campaign
+                </Button>
               </div>
             </div>
           </DialogContent>
@@ -178,9 +238,17 @@ export default function CampaignsPage() {
       <div className="flex items-center gap-4">
         <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
-          <Input className="pl-10" placeholder="Search campaigns…" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
+          <Input
+            className="pl-10"
+            placeholder="Search campaigns…"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+          />
         </div>
-        <Button variant="outline"><Filter className="w-4 h-4 mr-2" />Filter</Button>
+        <Button variant="outline">
+          <Filter className="w-4 h-4 mr-2" />
+          Filter
+        </Button>
       </div>
 
       {/* Grid */}
@@ -197,11 +265,23 @@ export default function CampaignsPage() {
               </div>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm"><MoreHorizontal className="w-4 h-4" /></Button>
+                  <Button variant="ghost" size="sm">
+                    <MoreHorizontal className="w-4 h-4" />
+                  </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem onClick={() => toggleStatus(c.id, c.status)}>
-                    {c.status === "active" ? (<><Pause className="w-4 h-4 mr-2" />Pause</>) : (<><Play className="w-4 h-4 mr-2" />Launch</>)}
+                    {c.status === "active" ? (
+                      <>
+                        <Pause className="w-4 h-4 mr-2" />
+                        Pause
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-4 h-4 mr-2" />
+                        Launch
+                      </>
+                    )}
                   </DropdownMenuItem>
                   <DropdownMenuItem>
                     <BarChart3 className="w-4 h-4 mr-2" />
@@ -212,15 +292,37 @@ export default function CampaignsPage() {
             </CardHeader>
             <CardContent>
               <div className="grid grid-cols-4 gap-4">
-                <Stat icon={<Users className="w-5 h-5 text-blue-600" />} label="Total Leads" value={c.totalLeads} bg="bg-blue-100" />
-                <Stat icon={<Mail className="w-5 h-5 text-green-600" />} label="Contacted" value={c.contactedLeads} bg="bg-green-100" />
-                <Stat icon={<MessageSquare className="w-5 h-5 text-amber-600" />} label="Responses" value={c.responses} bg="bg-amber-100" />
-                <Stat icon={<BarChart3 className="w-5 h-5 text-purple-600" />} label="Conversions" value={c.conversions} bg="bg-purple-100" />
+                <Stat
+                  icon={<Users className="w-5 h-5 text-blue-600" />}
+                  label="Total Leads"
+                  value={c.totalLeads}
+                  bg="bg-blue-100"
+                />
+                <Stat
+                  icon={<Mail className="w-5 h-5 text-green-600" />}
+                  label="Contacted"
+                  value={c.contactedLeads}
+                  bg="bg-green-100"
+                />
+                <Stat
+                  icon={<MessageSquare className="w-5 h-5 text-amber-600" />}
+                  label="Responses"
+                  value={c.responses}
+                  bg="bg-amber-100"
+                />
+                <Stat
+                  icon={<BarChart3 className="w-5 h-5 text-purple-600" />}
+                  label="Conversions"
+                  value={c.conversions}
+                  bg="bg-purple-100"
+                />
               </div>
               <div className="mt-4 pt-4 border-t text-sm text-gray-600 flex justify-between">
                 <span>Created {new Date(c.createdAt).toLocaleDateString()}</span>
                 <span className="text-indigo-600 font-medium">
-                  {c.totalLeads > 0 ? `${((c.responses / c.totalLeads) * 100).toFixed(1)}% response rate` : "No data yet"}
+                  {c.totalLeads > 0
+                    ? `${((c.responses / c.totalLeads) * 100).toFixed(1)}% response rate`
+                    : "No data yet"}
                 </span>
               </div>
             </CardContent>
