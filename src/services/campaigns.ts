@@ -1,7 +1,11 @@
 // src/services/campaigns.ts
-// Robust client-only attach with API attempts first, then local DB with
-// (a) leads upsert/create to satisfy FKs, then (b) join attach or (c) stamp campaignId.
-// No hard import of "@/lib/blink" — resolves lazily or from global.
+// Attach leads with multiple safety nets:
+// 1) Try API endpoints (Netlify function etc.)
+// 2) Client DB: ensure leads exist -> join attach -> stamp campaignId on leads
+// 3) If no usable tables, attach onto the campaign row itself (attachedLeadIds | leadIds | leads)
+// 4) Absolute last resort: localStorage persistence
+//
+// No hard import of "@/lib/blink" (lazy-resolves or uses global).
 
 export type AttachResult = { inserted: number; skipped: number };
 
@@ -11,7 +15,6 @@ let _blink: any | null = null;
 async function getBlinkClient(): Promise<any | null> {
   if (_blink !== null) return _blink;
   try {
-    // Lazy import so bundlers don’t choke if alias isn’t present
     const mod: any = await import("@/blink/client");
     _blink = mod?.blink ?? mod?.default ?? mod ?? null;
   } catch {
@@ -43,14 +46,15 @@ async function httpJSON<T = any>(url: string, body?: any): Promise<T | null> {
   }
 }
 
-/* ------------------------ local DB discovery helpers ------------------------ */
+const isDup = (e: any) =>
+  /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
 
-function dbKeys(db: any): string[] {
-  return Object.keys(db || {});
-}
+const keysOf = (obj: any) => Object.keys(obj || {});
+
+/* ----------------------- client DB discovery + helpers ---------------------- */
 
 function findJoinKey(db: any): string | null {
-  const keys = dbKeys(db);
+  const keys = keysOf(db);
   const preferred = [
     "campaignsLeads",
     "campaign_leads",
@@ -59,18 +63,19 @@ function findJoinKey(db: any): string | null {
     "leadCampaign",
   ];
   for (const k of preferred) if (typeof db?.[k]?.create === "function") return k;
-  const found =
+
+  return (
     keys.find(
       (k) =>
         /campaign/i.test(k) &&
         /lead/i.test(k) &&
         typeof db?.[k]?.create === "function",
-    ) ?? null;
-  return found;
+    ) ?? null
+  );
 }
 
 function findLeadsKey(db: any): string | null {
-  const keys = dbKeys(db);
+  const keys = keysOf(db);
   const preferred = [
     "leads",
     "lead",
@@ -97,9 +102,6 @@ function findLeadsKey(db: any): string | null {
   return discovered ?? null;
 }
 
-const isDup = (e: any) =>
-  /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
-
 async function ensureLeadsExist(db: any, leadsKey: string, ids: string[]) {
   const t = db?.[leadsKey];
   if (!t) return;
@@ -111,7 +113,6 @@ async function ensureLeadsExist(db: any, leadsKey: string, ids: string[]) {
   } catch {}
 
   for (const id of ids) {
-    // Try upsert -> create; we only set minimal fields to satisfy FK
     const createDoc = userId ? { id, userId } : { id };
     try {
       if (typeof t.upsert === "function") {
@@ -126,7 +127,6 @@ async function ensureLeadsExist(db: any, leadsKey: string, ids: string[]) {
         await t.create(createDoc);
       }
     } catch (e) {
-      // ignore (FKs may not require an existing lead row)
       if (isDup(e)) continue;
     }
   }
@@ -155,7 +155,6 @@ async function attachViaJoin(db: any, joinKey: string, campaignId: string, ids: 
           return "ok";
         } catch (e) {
           if (isDup(e)) return "dup";
-          // try next key combo
         }
       }
     }
@@ -179,7 +178,6 @@ async function attachViaJoin(db: any, joinKey: string, campaignId: string, ids: 
     if (r === "ok") inserted++;
     else if (r === "dup") skipped++;
   }
-
   return { inserted, skipped };
 }
 
@@ -213,8 +211,67 @@ async function stampCampaignOnLeads(db: any, leadsKey: string, campaignId: strin
     if (r === "ok") inserted++;
     else if (r === "dup") skipped++;
   }
-
   return { inserted, skipped };
+}
+
+/* ------------- last-ditch: attach IDs onto the campaign row itself ---------- */
+
+async function attachOnCampaignRow(db: any, campaignId: string, ids: string[]) {
+  const ctbl = db?.campaigns;
+  if (!ctbl) return { inserted: 0, skipped: 0, tried: false };
+
+  const fields = ["attachedLeadIds", "leadIds", "leads"];
+  for (const field of fields) {
+    try {
+      // Read existing if possible (best-effort)
+      let existing: string[] = [];
+      try {
+        if (typeof ctbl.get === "function") {
+          const cur = await ctbl.get(campaignId);
+          const arr = cur?.[field];
+          if (Array.isArray(arr)) existing = arr.filter(Boolean);
+        }
+      } catch {}
+
+      const before = new Set(existing);
+      const merged = Array.from(new Set([...existing, ...ids]));
+      const patch: any = { [field]: merged };
+
+      if (typeof ctbl.update === "function") { await ctbl.update(campaignId, patch); }
+      else if (typeof ctbl.patch === "function") { await ctbl.patch(campaignId, patch); }
+      else if (typeof ctbl.upsert === "function") {
+        await ctbl.upsert({ where: { id: campaignId }, update: patch, create: { id: campaignId, ...patch } });
+      } else {
+        continue; // try next field
+      }
+
+      const inserted = merged.length - before.size;
+      const skipped = ids.length - inserted;
+      return { inserted, skipped, tried: true };
+    } catch (e) {
+      // try next field name
+      continue;
+    }
+  }
+  return { inserted: 0, skipped: 0, tried: true };
+}
+
+/* ------------------------- ultimate: localStorage map ------------------------ */
+
+function attachInLocalStorage(campaignId: string, ids: string[]) {
+  try {
+    const k = `sv:camp:${campaignId}`;
+    const cur = JSON.parse(localStorage.getItem(k) || "[]") as string[];
+    const before = new Set(cur);
+    const merged = Array.from(new Set([...cur, ...ids]));
+    localStorage.setItem(k, JSON.stringify(merged));
+    const inserted = merged.length - before.size;
+    const skipped = ids.length - inserted;
+    console.warn("[campaignsService.attachLeads] Using localStorage fallback", { campaignId, inserted, skipped });
+    return { inserted, skipped };
+  } catch {
+    return { inserted: 0, skipped: 0 };
+  }
 }
 
 /* --------------------------------- service --------------------------------- */
@@ -257,68 +314,65 @@ const campaignsService = {
     };
     const created = await blink.db.campaigns.create(payload);
     return { id: created.id ?? payload.id, name: created.name ?? payload.name };
+    // (If you need it, you can also patch an empty attachedLeadIds: [] here.)
   },
 
   async attachLeads(campaignId: string, leadIds: string[]): Promise<AttachResult> {
     const ids = Array.from(new Set(leadIds)).filter(Boolean);
     if (!campaignId || ids.length === 0) return { inserted: 0, skipped: 0 };
 
-    // 1) Try server endpoints (OK if they succeed; otherwise we fall back)
+    // 1) Server endpoints (Netlify function + fallbacks)
     const apiOrder = [
       `/.netlify/functions/campaigns?id=${encodeURIComponent(campaignId)}`,
       `/api/campaigns/${encodeURIComponent(campaignId)}/leads`,
       `/api/campaigns/add-leads`,
       `/api/campaigns/attach`,
     ];
-
     for (const url of apiOrder) {
-      const res = await httpJSON<AttachResult & { reason?: string; debug?: any }>(url, {
-        campaignId,
-        leadIds: ids,
-      });
+      const res = await httpJSON<AttachResult & { reason?: string; debug?: any }>(url, { campaignId, leadIds: ids });
       if (res) {
         if ((res as any).reason || (res as any).debug) {
           console.log("[campaignsService.attachLeads] server response", { url, ...res });
         }
         if (Number.isFinite(res.inserted) && Number.isFinite(res.skipped)) {
           if ((res.inserted ?? 0) > 0 || (res.skipped ?? 0) > 0) return res;
-          // if the server returns 0/0, continue to local DB fallback
         }
       }
     }
 
-    // 2) Local DB fallback with FK-safe flow
+    // 2) Client DB attach flow
     const blink = await getBlinkClient();
     const db: any = blink?.db;
     if (!db) {
-      console.warn("[campaignsService.attachLeads] No local DB available.");
-      return { inserted: 0, skipped: 0 };
+      console.warn("[campaignsService.attachLeads] No local DB object found.");
+      return attachInLocalStorage(campaignId, ids);
     }
 
+    const allKeys = keysOf(db);
     const joinKey = findJoinKey(db);
     const leadsKey = findLeadsKey(db);
+    console.log("[campaignsService.attachLeads] local discovery", { joinKey, leadsKey, allKeys });
 
-    console.log("[campaignsService.attachLeads] local discovery", { joinKey, leadsKey, allKeys: dbKeys(db) });
+    if (leadsKey) await ensureLeadsExist(db, leadsKey, ids);
 
-    // 2a) If there is a leads table, ensure the lead rows exist first (to satisfy FKs)
-    if (leadsKey) {
-      await ensureLeadsExist(db, leadsKey, ids);
-    }
-
-    // 2b) Prefer join table if present
     if (joinKey) {
       const { inserted, skipped } = await attachViaJoin(db, joinKey, campaignId, ids);
       if (inserted > 0 || skipped > 0) return { inserted, skipped };
     }
 
-    // 2c) Stamp campaign field on leads table if possible
     if (leadsKey) {
       const { inserted, skipped } = await stampCampaignOnLeads(db, leadsKey, campaignId, ids);
-      return { inserted, skipped };
+      if (inserted > 0 || skipped > 0) return { inserted, skipped };
     }
 
-    // 2d) Nothing usable
-    return { inserted: 0, skipped: 0 };
+    // 3) Attach on the campaign row itself
+    try {
+      const r = await attachOnCampaignRow(db, campaignId, ids);
+      if (r.tried && (r.inserted > 0 || r.skipped > 0)) return { inserted: r.inserted, skipped: r.skipped };
+    } catch {}
+
+    // 4) Last resort: localStorage
+    return attachInLocalStorage(campaignId, ids);
   },
 };
 
