@@ -1,4 +1,5 @@
 // src/pages/Campaigns.tsx
+import campaignsService from "@/services/campaigns";
 import React, { useEffect, useState } from "react";
 import {
   Plus, Search, Filter, MoreHorizontal, Play, Pause, BarChart3, Users, Mail, MessageSquare
