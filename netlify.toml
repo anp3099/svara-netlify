@@ -1,13 +1,9 @@
-[[redirects]]
-  from   = "/api/campaigns/:id/leads"
-  to     = "/.netlify/functions/campaigns/:id/leads"
-  status = 200
-  force  = true
-
+# --- Build output ---
 [build]
   command = "npm run build"
-  publish  = "dist"
+  publish = "dist"
 
+# --- Functions config ---
 [functions]
   directory    = "netlify/functions"
   node_bundler = "esbuild"
@@ -15,14 +11,30 @@
 [build.environment]
   NODE_VERSION = "22.12.0"
 
-# 1) /api/* -> serverless functions
+# --- Redirects (order matters!) ---
+
+# (Optional) quick health probe
+[[redirects]]
+  from   = "/api/_health"
+  to     = "/.netlify/functions/health"
+  status = 200
+  force  = true
+
+# 1) Canonical attach endpoint — pass :id as a query param to the function
+[[redirects]]
+  from   = "/api/campaigns/:id/leads"
+  to     = "/.netlify/functions/campaigns?id=:id"
+  status = 200
+  force  = true
+
+# 2) Generic /api/* → serverless functions
 [[redirects]]
   from   = "/api/*"
   to     = "/.netlify/functions/:splat"
   status = 200
   force  = true
 
-# 2) SPA fallback
+# 3) SPA fallback
 [[redirects]]
   from   = "/*"
   to     = "/index.html"
