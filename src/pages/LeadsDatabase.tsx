@@ -1,5 +1,5 @@
 // Add near imports:
-// import campaignService from "@/services/campaigns";
+import campaignService from "@/services/campaigns";
 
 function AddToCampaignDialog({
   open,
@@ -64,8 +64,8 @@ function AddToCampaignDialog({
     try {
       setAttaching(true);
       const { inserted, skipped } = await campaignService.attachLeads(
-        campaignId,
-        selectedLeadIds
+        selectedCampaignId,
+        leadIds
       );
       onOpenChange(false);
       alert(
