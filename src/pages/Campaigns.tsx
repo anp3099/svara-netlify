@@ -1,10 +1,11 @@
 // src/pages/Campaigns.tsx
-import React, { useEffect, useState } from "react";
-import {
-  Plus, Search, Filter, MoreHorizontal, Play, Pause,
-  BarChart3, Users, Mail, MessageSquare
-} from "lucide-react";
+import React, { useEffect, useMemo, useState } from "react";
+import campaignsService from "@/services/campaigns";
+import { blink } from "@/blink/client";
 
+import {
+  Plus, Search, Filter, MoreHorizontal, Play, Pause, BarChart3, Users, Mail, MessageSquare
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -15,21 +16,19 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-import { blink } from "@/blink/client";
-import { campaignsService, type CampaignRow } from "@/services/campaigns";
-
 type Campaign = {
   id: string;
-  userId: string;
+  userId?: string;
   productId?: string | null;
   name: string;
-  description: string;
+  description?: string;
   status: "draft" | "active" | "paused" | "completed";
+  createdAt: string;
+  // derived / stats
   totalLeads: number;
   contactedLeads: number;
   responses: number;
   conversions: number;
-  createdAt: string;
 };
 
 type Product = { id: string; name: string };
@@ -40,86 +39,157 @@ export default function CampaignsPage() {
   const [searchTerm, setSearchTerm] = useState("");
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [loadingStats, setLoadingStats] = useState(false);
   const [newCampaign, setNewCampaign] = useState({ name: "", description: "", product_id: "" });
 
+  // --- initial load: list campaigns + products
   useEffect(() => {
     (async () => {
       try {
         setLoading(true);
-
         const me = await blink.auth.me().catch(() => null);
 
-        // 1) List campaigns (API-first via service), then hydrate counts from server
-        const baseRows: CampaignRow[] = await campaignsService.list();
-        const rowsWithCounts = await campaignsService.hydrateCounts(baseRows);
+        // 1) Prefer serverless list (works even if client DB is hidden)
+        const listViaApi = async (): Promise<Campaign[]> => {
+          const res = await fetch("/api/campaigns?list=1").catch(() => null);
+          if (!res || !res.ok) return [];
+          const data = await res.json().catch(() => ({}));
+          const rows: any[] = Array.isArray(data?.rows) ? data.rows : [];
+          return rows.map((r) => ({
+            id: r?.id ?? r?.key ?? r?.uuid ?? r?.campaignId ?? r?.campaign_id ?? `camp_${Date.now()}`,
+            name: r?.name ?? "Untitled",
+            description: r?.description ?? "",
+            status: (r?.status as Campaign["status"]) || "draft",
+            createdAt: r?.createdAt ?? r?.created_at ?? new Date().toISOString(),
+            totalLeads: 0,
+            contactedLeads: 0,
+            responses: 0,
+            conversions: 0,
+          }));
+        };
 
-        // Map to the local Campaign type the UI expects
-        const mapped: Campaign[] = rowsWithCounts.map((r) => ({
-          id: r.id,
-          userId: (me?.id as string) ?? "",
-          productId: (r as any).productId ?? null,
-          name: r.name,
-          description: r.description ?? "",
-          status: ((r as any).status as Campaign["status"]) ?? "draft",
-          totalLeads: r.totalLeads ?? 0,
-          contactedLeads: (r as any).contactedLeads ?? 0,
-          responses: (r as any).responses ?? 0,
-          conversions: (r as any).conversions ?? 0,
-          createdAt: r.createdAt ?? new Date().toISOString(),
-        }));
+        // 2) Fallback to client DB service if needed
+        const listViaClient = async (): Promise<Campaign[]> => {
+          const rows = await campaignsService.list(me?.id);
+          return (rows || []).map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            description: r.description ?? "",
+            status: (r.status as Campaign["status"]) || "draft",
+            createdAt: r.createdAt ?? new Date().toISOString(),
+            totalLeads: 0,
+            contactedLeads: 0,
+            responses: 0,
+            conversions: 0,
+          }));
+        };
 
-        // 2) Products (client DB; fine to do on the browser)
-        const prod =
-          (await (blink as any).db?.products?.list?.({
-            where: me?.id ? { userId: me.id } : undefined,
-            limit: 200,
-          })) ?? [];
+        const [listRows, prodRows] = await Promise.all([
+          listViaApi().then((rows) => rows.length ? rows : listViaClient()),
+          ((blink as any).db?.products?.list?.({ where: me?.id ? { userId: me.id } : undefined, limit: 200 }) ?? [])
+        ]);
 
-        setCampaigns(mapped);
-        setProducts(prod.map((p: any) => ({ id: p.id || p.key, name: p.name })));
+        setCampaigns(listRows);
+        setProducts((prodRows || []).map((p: any) => ({ id: p.id || p.key, name: p.name })));
       } finally {
         setLoading(false);
       }
     })();
   }, []);
 
+  // --- stats after campaigns are loaded
+  useEffect(() => {
+    if (!campaigns.length) return;
+    (async () => {
+      try {
+        setLoadingStats(true);
+        const ids = campaigns.map((c) => c.id).filter(Boolean);
+        const res = await fetch(`/api/campaigns?stats=1&ids=${encodeURIComponent(ids.join(","))}`).catch(() => null);
+        if (!res || !res.ok) return;
+        const data = await res.json().catch(() => ({}));
+        const counts = data?.counts || {};
+        // counts should look like { [campaignId]: { total, contacted, responses, conversions } }
+        setCampaigns((prev) =>
+          prev.map((c) => {
+            const s = counts[c.id] || {};
+            return {
+              ...c,
+              totalLeads: Number(s.total ?? s.totalLeads ?? 0),
+              contactedLeads: Number(s.contacted ?? s.contactedLeads ?? 0),
+              responses: Number(s.responses ?? 0),
+              conversions: Number(s.conversions ?? 0),
+            };
+          })
+        );
+      } finally {
+        setLoadingStats(false);
+      }
+    })();
+  }, [campaigns.length]);
+
   const createCampaign = async () => {
     if (!newCampaign.name.trim()) return alert("Enter a name");
     if (!newCampaign.product_id) return alert("Pick a product");
     const me = await blink.auth.me();
 
-    const created = await campaignsService.create({
+    const created: any = await campaignsService.create({
       userId: me.id,
       name: newCampaign.name.trim(),
       description: newCampaign.description.trim(),
       productId: newCampaign.product_id,
     });
 
-    // Add new card optimistically (counts will be 0 until leads are attached)
-    setCampaigns((prev) => [
-      {
-        id: created.id,
-        userId: me.id,
-        productId: newCampaign.product_id,
-        name: created.name,
-        description: newCampaign.description.trim(),
-        status: "draft",
-        totalLeads: 0,
-        contactedLeads: 0,
-        responses: 0,
-        conversions: 0,
-        createdAt: new Date().toISOString(),
-      },
-      ...prev.filter((c) => c.id !== created.id),
-    ]);
+    const newRow: Campaign = {
+      id: created.id,
+      name: created.name,
+      description: created.description ?? "",
+      status: created.status || "draft",
+      createdAt: created.createdAt || new Date().toISOString(),
+      totalLeads: 0,
+      contactedLeads: 0,
+      responses: 0,
+      conversions: 0,
+    };
 
+    setCampaigns((prev) => [newRow, ...prev.filter((c) => c.id !== created.id)]);
     setIsCreateDialogOpen(false);
     setNewCampaign({ name: "", description: "", product_id: "" });
+
+    // kick a stats refresh for the single new id
+    try {
+      const res = await fetch(`/api/campaigns?stats=1&ids=${encodeURIComponent(created.id)}`);
+      const data = await res.json().catch(() => ({}));
+      const s = data?.counts?.[created.id] || {};
+      setCampaigns((prev) =>
+        prev.map((c) =>
+          c.id === created.id
+            ? {
+                ...c,
+                totalLeads: Number(s.total ?? 0),
+                contactedLeads: Number(s.contacted ?? 0),
+                responses: Number(s.responses ?? 0),
+                conversions: Number(s.conversions ?? 0),
+              }
+            : c
+        )
+      );
+    } catch {}
   };
+
+  const filtered = useMemo(
+    () =>
+      campaigns.filter(
+        (c) =>
+          c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+          (c.description ?? "").toLowerCase().includes(searchTerm.toLowerCase())
+      ),
+    [campaigns, searchTerm]
+  );
 
   const toggleStatus = (id: string, status: Campaign["status"]) => {
     const next = status === "active" ? "paused" : "active";
     setCampaigns((p) => p.map((c) => (c.id === id ? { ...c, status: next } : c)));
+    // (optional) call a serverless endpoint to persist status if you need
   };
 
   const getStatusBadge = (status: string) => {
@@ -132,12 +202,6 @@ export default function CampaignsPage() {
     const cfg = map[status] || map.draft;
     return <Badge variant={cfg.variant as any}>{cfg.label}</Badge>;
   };
-
-  const filtered = campaigns.filter(
-    (c) =>
-      c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      c.description?.toLowerCase().includes(searchTerm.toLowerCase())
-  );
 
   if (loading) {
     return (
@@ -190,24 +254,13 @@ export default function CampaignsPage() {
                 </div>
                 <div className="space-y-2">
                   <Label>Product</Label>
-                  <Select
-                    value={newCampaign.product_id}
-                    onValueChange={(v) => setNewCampaign((p) => ({ ...p, product_id: v }))}
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select product" />
-                    </SelectTrigger>
+                  <Select value={newCampaign.product_id} onValueChange={(v) => setNewCampaign((p) => ({ ...p, product_id: v }))}>
+                    <SelectTrigger><SelectValue placeholder="Select product" /></SelectTrigger>
                     <SelectContent>
                       {products.length ? (
-                        products.map((p) => (
-                          <SelectItem key={p.id} value={p.id}>
-                            {p.name}
-                          </SelectItem>
-                        ))
+                        products.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)
                       ) : (
-                        <SelectItem value="no" disabled>
-                          No products found
-                        </SelectItem>
+                        <SelectItem value="no" disabled>No products found</SelectItem>
                       )}
                     </SelectContent>
                   </Select>
@@ -222,12 +275,8 @@ export default function CampaignsPage() {
                 />
               </div>
               <div className="flex justify-end gap-2">
-                <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>
-                  Cancel
-                </Button>
-                <Button onClick={createCampaign} disabled={!newCampaign.name || !newCampaign.product_id}>
-                  Create Campaign
-                </Button>
+                <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>Cancel</Button>
+                <Button onClick={createCampaign} disabled={!newCampaign.name || !newCampaign.product_id}>Create Campaign</Button>
               </div>
             </div>
           </DialogContent>
@@ -238,16 +287,37 @@ export default function CampaignsPage() {
       <div className="flex items-center gap-4">
         <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
-          <Input
-            className="pl-10"
-            placeholder="Search campaigns…"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-          />
+          <Input className="pl-10" placeholder="Search campaigns…" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
         </div>
-        <Button variant="outline">
+        <Button variant="outline" disabled={loadingStats} onClick={() => {
+          // manual refresh stats
+          setCampaigns((prev) => [...prev]); // trigger effect by changing length? do a direct call:
+          (async () => {
+            try {
+              setLoadingStats(true);
+              const ids = campaigns.map((c) => c.id).filter(Boolean);
+              const res = await fetch(`/api/campaigns?stats=1&ids=${encodeURIComponent(ids.join(","))}`);
+              const data = await res.json().catch(() => ({}));
+              const counts = data?.counts || {};
+              setCampaigns((prev) =>
+                prev.map((c) => {
+                  const s = counts[c.id] || {};
+                  return {
+                    ...c,
+                    totalLeads: Number(s.total ?? 0),
+                    contactedLeads: Number(s.contacted ?? 0),
+                    responses: Number(s.responses ?? 0),
+                    conversions: Number(s.conversions ?? 0),
+                  };
+                })
+              );
+            } finally {
+              setLoadingStats(false);
+            }
+          })();
+        }}>
           <Filter className="w-4 h-4 mr-2" />
-          Filter
+          {loadingStats ? "Refreshing…" : "Refresh counts"}
         </Button>
       </div>
 
@@ -265,23 +335,11 @@ export default function CampaignsPage() {
               </div>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm">
-                    <MoreHorizontal className="w-4 h-4" />
-                  </Button>
+                  <Button variant="ghost" size="sm"><MoreHorizontal className="w-4 h-4" /></Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem onClick={() => toggleStatus(c.id, c.status)}>
-                    {c.status === "active" ? (
-                      <>
-                        <Pause className="w-4 h-4 mr-2" />
-                        Pause
-                      </>
-                    ) : (
-                      <>
-                        <Play className="w-4 h-4 mr-2" />
-                        Launch
-                      </>
-                    )}
+                    {c.status === "active" ? (<><Pause className="w-4 h-4 mr-2" />Pause</>) : (<><Play className="w-4 h-4 mr-2" />Launch</>)}
                   </DropdownMenuItem>
                   <DropdownMenuItem>
                     <BarChart3 className="w-4 h-4 mr-2" />
@@ -292,37 +350,15 @@ export default function CampaignsPage() {
             </CardHeader>
             <CardContent>
               <div className="grid grid-cols-4 gap-4">
-                <Stat
-                  icon={<Users className="w-5 h-5 text-blue-600" />}
-                  label="Total Leads"
-                  value={c.totalLeads}
-                  bg="bg-blue-100"
-                />
-                <Stat
-                  icon={<Mail className="w-5 h-5 text-green-600" />}
-                  label="Contacted"
-                  value={c.contactedLeads}
-                  bg="bg-green-100"
-                />
-                <Stat
-                  icon={<MessageSquare className="w-5 h-5 text-amber-600" />}
-                  label="Responses"
-                  value={c.responses}
-                  bg="bg-amber-100"
-                />
-                <Stat
-                  icon={<BarChart3 className="w-5 h-5 text-purple-600" />}
-                  label="Conversions"
-                  value={c.conversions}
-                  bg="bg-purple-100"
-                />
+                <Stat icon={<Users className="w-5 h-5 text-blue-600" />} label="Total Leads" value={c.totalLeads} bg="bg-blue-100" />
+                <Stat icon={<Mail className="w-5 h-5 text-green-600" />} label="Contacted" value={c.contactedLeads} bg="bg-green-100" />
+                <Stat icon={<MessageSquare className="w-5 h-5 text-amber-600" />} label="Responses" value={c.responses} bg="bg-amber-100" />
+                <Stat icon={<BarChart3 className="w-5 h-5 text-purple-600" />} label="Conversions" value={c.conversions} bg="bg-purple-100" />
               </div>
               <div className="mt-4 pt-4 border-t text-sm text-gray-600 flex justify-between">
                 <span>Created {new Date(c.createdAt).toLocaleDateString()}</span>
                 <span className="text-indigo-600 font-medium">
-                  {c.totalLeads > 0
-                    ? `${((c.responses / c.totalLeads) * 100).toFixed(1)}% response rate`
-                    : "No data yet"}
+                  {c.totalLeads > 0 ? `${((c.responses / c.totalLeads) * 100).toFixed(1)}% response rate` : "No data yet"}
                 </span>
               </div>
             </CardContent>
