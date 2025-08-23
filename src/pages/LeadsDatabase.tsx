@@ -37,7 +37,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 
 import { blink } from "@/blink/client"
 import * as ReactDOM from "react-dom"
-import { campaignsService as _campaignsService } from "@/services/campaigns" // uses your real service (with fallbacks below)
+import { campaignsService as _campaignsService } from "@/services/campaigns" // ok if missing; we guard
 
 /** ---------- Types ---------- */
 type Lead = {
@@ -55,7 +55,6 @@ type Lead = {
   linkedinUrl: string
   leadScore: number
   dataSource: string
-  // optional enrichment
   pdlEnriched?: boolean
   pdlEnrichmentScore?: number
   pdlExperienceSummary?: string
@@ -67,7 +66,7 @@ type Lead = {
 
 type Campaign = { id: string; name: string; status?: string; createdAt?: string }
 
-/** ---------- Fallback sample rows (only if API returns nothing) ---------- */
+/** ---------- Fallback sample rows ---------- */
 const sampleLeads: Lead[] = [
   {
     id: "demo_1",
@@ -103,7 +102,7 @@ const sampleLeads: Lead[] = [
   },
 ]
 
-/** ---------- Helpers to map your /api/leads blobs into UI rows ---------- */
+/** ---------- Helpers ---------- */
 const toStr = (v: any) => (v === undefined || v === null ? "" : String(v))
 const titleCase = (s: string) => s.replace(/\b\w/g, (m) => m.toUpperCase())
 
@@ -120,30 +119,22 @@ function tryParseArray(v: any): string[] | any[] | undefined {
 
 function mapApiItemToLead(item: any): Lead {
   const raw = item?.raw ?? {}
-
   const first = raw.first_name || raw.person_first_name || ""
   const last = raw.last_name || raw.person_last_name || ""
   const fullName = (item.full_name || `${first} ${last}`).trim()
-
   const companyName =
     item.company_name || raw.company_name || raw.person_company_name || "Unknown Company"
-
   const industry = raw.company_industry || item.industry || "Unknown"
-  const companySize =
-    raw.company_size || raw.company_size_range || item.company_size || ""
+  const companySize = raw.company_size || raw.company_size_range || item.company_size || ""
   const revenue = raw.company_revenue || raw.company_revenue_range || item.company_revenue || ""
-
   const city = raw.person_city || raw.company_city || ""
   const country = raw.person_country || raw.company_country || ""
   const location = [city, country].filter(Boolean).join(", ")
-
   const domain = item.domain || raw.company_domain || raw.website || raw.company_website || ""
   const website = domain ? (domain.startsWith("http") ? domain : `https://${domain}`) : ""
-
   const title = item.title || raw.person_job_title || raw.person_headline || ""
   const phone = raw.person_phone || ""
   const linkedin = item.linkedin || raw.person_linkedin_url || ""
-
   const leadScore = Number(item.score ?? 0)
 
   return {
@@ -171,7 +162,6 @@ function mapApiItemToLead(item: any): Lead {
   }
 }
 
-/** ---------- Small labeled row component ---------- */
 function Labeled({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
@@ -181,7 +171,21 @@ function Labeled({ label, children }: { label: string; children: React.ReactNode
   )
 }
 
-/** ---------- Add-to-Campaign Modal (uses services with safe fallbacks) ---------- */
+/** ---------- HTTP helper (throws with status text) ---------- */
+async function httpJSON(input: RequestInfo, init?: RequestInit) {
+  const res = await fetch(input, {
+    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    ...init,
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => "")
+    const msg = text || `${init?.method || "GET"} ${typeof input === "string" ? input : ""} -> ${res.status}`
+    throw new Error(msg)
+  }
+  return res.json().catch(() => ({}))
+}
+
+/** ---------- Add-to-Campaign Modal ---------- */
 function AddToCampaignModal({
   open,
   onOpenChange,
@@ -202,10 +206,9 @@ function AddToCampaignModal({
   const [err, setErr] = useState<string | null>(null)
 
   const loadCampaigns = async () => {
-    setErr(null)
     setLoading(true)
+    setErr(null)
     try {
-      // Prefer your service; fall back to blink directly if needed
       const svc: any = _campaignsService as any
       let list: any[] | null = null
 
@@ -261,7 +264,6 @@ function AddToCampaignModal({
         })
       }
 
-      // duplicate/constraint friendly handling
       if (!created?.id && created?.error) throw new Error(created.error)
 
       const newItem: Campaign = {
@@ -274,77 +276,102 @@ function AddToCampaignModal({
       setCampaigns((prev) => [newItem, ...prev])
       setSelectedCampaignId(newItem.id)
       setNewName("")
+      setErr(null)
     } catch (e: any) {
       const m = String(e?.message || e)
+      // If duplicate, auto-select existing
       if (m.toLowerCase().includes("duplicate") || m.toLowerCase().includes("constraint")) {
-        // If duplicate, try to select the existing one automatically
         const existing = campaigns.find(
           (c) => c.name.toLowerCase().trim() === newName.toLowerCase().trim(),
         )
         if (existing) {
           setSelectedCampaignId(existing.id)
           setNewName("")
-        } else {
-          setErr("Constraint violation – duplicate or invalid data")
+          setErr(null)
+          return
         }
-      } else {
-        setErr(m || "Failed to create campaign")
       }
+      setErr("Constraint violation – duplicate or invalid data")
     } finally {
       setCreating(false)
     }
   }
 
-  // Very defensive add-to-campaign that supports multiple backend shapes.
+  /** Try several ways to attach, then DB fallbacks with auto-discovery of a join table */
   const attachLeads = async () => {
-    if (!selectedCampaignId || !leadIds.length) return
+    const uniqueLeadIds = Array.from(new Set(leadIds))
+    if (!selectedCampaignId || uniqueLeadIds.length === 0) return
+
     setAdding(true)
     setErr(null)
     try {
-      const svc: any = _campaignsService as any
-      if (svc?.addLeadsToCampaign) {
-        await svc.addLeadsToCampaign(selectedCampaignId, leadIds)
-      } else if (svc?.attachLeads) {
-        await svc.attachLeads(selectedCampaignId, leadIds)
-      } else {
-        // DB fallback: try common join-table names; if none, update leads with campaignId
+      // 1) API attempts
+      const apiVariants = [
+        { url: `/api/campaigns/${selectedCampaignId}/leads`, method: "POST" },
+        { url: `/api/campaigns/add-leads`, method: "POST" },
+        { url: `/api/campaigns/attach`, method: "POST" },
+      ] as const
+
+      let apiWorked = false
+      for (const v of apiVariants) {
+        try {
+          await httpJSON(v.url, {
+            method: v.method,
+            body: JSON.stringify({ campaignId: selectedCampaignId, leadIds: uniqueLeadIds }),
+          })
+          apiWorked = true
+          break
+        } catch (e) {
+          // try next
+        }
+      }
+
+      if (!apiWorked) {
+        // 2) DB fallback – try join table first
         const db: any = (blink as any).db
-        const tryTables = [
-          "campaignLeads",
-          "campaign_leads",
-          "campaignMembers",
-          "campaign_members",
-          "campaignToLead",
-        ]
-        let usedJoin = false
-        for (const t of tryTables) {
-          if (db?.[t]?.create) {
-            usedJoin = true
-            // de-dup gently
-            for (const leadId of leadIds) {
-              try {
-                await db[t].create({ campaignId: selectedCampaignId, leadId })
-              } catch (err) {
-                // ignore duplicates
-              }
-            }
-            break
-          }
-        }
-        if (!usedJoin) {
-          // last-resort: patch lead rows
-          for (const leadId of leadIds) {
+        if (!db) throw new Error("DB unavailable")
+
+        const dbKeys = Object.keys(db || {})
+        const joinKey =
+          dbKeys.find(
+            (k) =>
+              /campaign/i.test(k) &&
+              /lead/i.test(k) &&
+              typeof db[k]?.create === "function",
+          ) || null
+
+        let success = 0
+
+        if (joinKey) {
+          for (const leadId of uniqueLeadIds) {
             try {
-              await db?.leads?.update?.(leadId, { campaignId: selectedCampaignId })
-            } catch (e) {
-              // ignore duplicates/patch issues
+              await db[joinKey].create({ campaignId: selectedCampaignId, leadId })
+              success++
+            } catch (e: any) {
+              // ignore duplicates/constraints for individual rows
+              continue
+            }
+          }
+        } else {
+          // last resort: update leads with campaignId
+          const leadsTableKey =
+            dbKeys.find((k) => /^leads$/i.test(k) && typeof db[k]?.update === "function") || "leads"
+          for (const leadId of uniqueLeadIds) {
+            try {
+              await db[leadsTableKey].update(leadId, { campaignId: selectedCampaignId })
+              success++
+            } catch {
+              continue
             }
           }
         }
+
+        if (success === 0) throw new Error("No rows attached (possible schema mismatch)")
       }
 
       onAttached()
       onOpenChange(false)
+      alert(`Attached ${uniqueLeadIds.length} lead(s) to the campaign.`)
     } catch (e: any) {
       setErr(String(e?.message || e) || "Failed to add to campaign")
     } finally {
@@ -372,7 +399,10 @@ function AddToCampaignModal({
           <div className="relative">
             <Select
               value={selectedCampaignId}
-              onValueChange={(v) => setSelectedCampaignId(v)}
+              onValueChange={(v) => {
+                setSelectedCampaignId(v)
+                setErr(null) // clear old banner
+              }}
               disabled={loading || !campaigns.length}
             >
               <SelectTrigger>
@@ -397,7 +427,10 @@ function AddToCampaignModal({
               <Input
                 placeholder="e.g., Q4 Outreach"
                 value={newName}
-                onChange={(e) => setNewName(e.target.value)}
+                onChange={(e) => {
+                  setNewName(e.target.value)
+                  if (err) setErr(null)
+                }}
                 disabled={creating}
               />
               <Button onClick={createCampaign} disabled={!newName.trim() || creating}>
@@ -1110,8 +1143,6 @@ export default function LeadsDatabase() {
         leadIds={selected}
         onAttached={() => {
           setSelected([])
-          // optional toast/alert
-          alert("Leads attached to campaign.")
         }}
       />
     </div>
