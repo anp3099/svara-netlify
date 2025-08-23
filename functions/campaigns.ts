@@ -2,9 +2,14 @@
 import type { Handler } from "@netlify/functions";
 
 type AttachResult = { inserted: number; skipped: number };
-const isDup = (e: any) => /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
+const isDup = (e: any) =>
+  /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
 
-function findTable(db: any, pattern: RegExp, needs: Array<"create"|"update"|"upsert"|"patch">) {
+function findTable(
+  db: any,
+  pattern: RegExp,
+  needs: Array<"create" | "update" | "upsert" | "patch">
+) {
   const keys = Object.keys(db || {});
   for (const k of keys) {
     if (!pattern.test(k)) continue;
@@ -14,7 +19,7 @@ function findTable(db: any, pattern: RegExp, needs: Array<"create"|"update"|"ups
   return null;
 }
 
-// Try a few places to import your server-side Blink
+// Try a few places to import your server-side Blink handle.
 function getBlink(): any {
   try { const m = require("../../src/lib/blink"); return m.default ?? m.blink ?? m; } catch {}
   try { const m = require("../../lib/blink");     return m.default ?? m.blink ?? m; } catch {}
@@ -24,36 +29,35 @@ function getBlink(): any {
 }
 
 export const handler: Handler = async (event) => {
-  // We only support POST /api/campaigns/:id/leads
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: JSON.stringify({ error: "Method not allowed" }) };
   }
 
-  // Example event.path: "/.netlify/functions/campaigns/123/leads"
+  // Because of your redirect, the function is invoked as:
+  // /.netlify/functions/campaigns/<id>/leads
+  // We also support query ?id=... just in case.
   const path = event.path || "";
-  const match = path.match(/\/campaigns\/([^/]+)\/leads\/?$/);
-  if (!match) {
-    return { statusCode: 404, body: JSON.stringify({ error: "Unknown campaigns sub-route" }) };
-  }
-  const campaignId = match[1];
+  const segMatch = path.match(/\/campaigns\/([^/]+)\/leads\/?$/);
+  const idFromPath = segMatch?.[1];
+  const idFromQuery = event.queryStringParameters?.id;
+  const campaignId = String(idFromPath || idFromQuery || "");
 
-  // body: { leadIds: string[] }
   const body = (() => { try { return JSON.parse(event.body || "{}"); } catch { return {}; } })();
   const leadIds: string[] = Array.isArray(body?.leadIds) ? body.leadIds.filter(Boolean) : [];
 
-  if (!leadIds.length) {
-    return { statusCode: 400, body: JSON.stringify({ error: "leadIds[] required" }) };
+  if (!campaignId || !leadIds.length) {
+    return { statusCode: 400, body: JSON.stringify({ error: "campaignId and leadIds[] required" }) };
   }
 
   const blink = getBlink();
   const db: any = blink?.db;
   if (!db) return { statusCode: 500, body: JSON.stringify({ error: "DB unavailable on server" }) };
 
-  // Locate join & leads tables
+  // Find tables
   const join = findTable(db, /campaign.*lead|lead.*campaign|^campaign[_]?leads?$/i, ["create","upsert"]);
   const leadsTbl = findTable(db, /^leads?$|prospect|contact|people|persons|records/i, ["create","update","upsert","patch"]);
 
-  // Ensure lead rows exist (FK-safe)
+  // Ensure leads exist (FK-safe)
   if (leadsTbl) {
     const me = await blink.auth?.me?.().catch(() => null);
     for (const lid of Array.from(new Set(leadIds))) {
@@ -102,7 +106,7 @@ export const handler: Handler = async (event) => {
     return { statusCode: 200, body: JSON.stringify({ inserted, skipped } as AttachResult) };
   }
 
-  // No join table -> last resort: stamp campaignId on leads
+  // Last resort: stamp campaignId directly on leads
   if (leadsTbl) {
     for (const lid of Array.from(new Set(leadIds))) {
       try {
