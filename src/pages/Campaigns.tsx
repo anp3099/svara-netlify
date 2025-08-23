@@ -18,17 +18,16 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 
 type Campaign = {
   id: string;
-  userId?: string;
+  userId: string;
   productId?: string | null;
   name: string;
-  description?: string;
+  description: string;
   status: "draft" | "active" | "paused" | "completed";
-  createdAt: string;
-  // derived / stats
   totalLeads: number;
   contactedLeads: number;
   responses: number;
   conversions: number;
+  createdAt: string;
 };
 
 type Product = { id: string; name: string };
@@ -39,93 +38,73 @@ export default function CampaignsPage() {
   const [searchTerm, setSearchTerm] = useState("");
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [loadingStats, setLoadingStats] = useState(false);
   const [newCampaign, setNewCampaign] = useState({ name: "", description: "", product_id: "" });
 
-  // --- initial load: list campaigns + products
+  // convenient map for merging stats fast
+  const byId = useMemo(() => {
+    const m = new Map<string, Campaign>();
+    campaigns.forEach((c) => m.set(c.id, c));
+    return m;
+  }, [campaigns]);
+
   useEffect(() => {
     (async () => {
       try {
         setLoading(true);
-        const me = await blink.auth.me().catch(() => null);
+        const me = await blink.auth.me();
 
-        // 1) Prefer serverless list (works even if client DB is hidden)
-        const listViaApi = async (): Promise<Campaign[]> => {
-          const res = await fetch("/api/campaigns?list=1").catch(() => null);
-          if (!res || !res.ok) return [];
-          const data = await res.json().catch(() => ({}));
-          const rows: any[] = Array.isArray(data?.rows) ? data.rows : [];
-          return rows.map((r) => ({
-            id: r?.id ?? r?.key ?? r?.uuid ?? r?.campaignId ?? r?.campaign_id ?? `camp_${Date.now()}`,
-            name: r?.name ?? "Untitled",
-            description: r?.description ?? "",
-            status: (r?.status as Campaign["status"]) || "draft",
-            createdAt: r?.createdAt ?? r?.created_at ?? new Date().toISOString(),
-            totalLeads: 0,
-            contactedLeads: 0,
-            responses: 0,
-            conversions: 0,
-          }));
-        };
+        // 1) list campaigns
+        const raw = await campaignsService.list(me.id);
+        const base: Campaign[] = raw.map((r: any) => ({
+          id: r.id,
+          userId: me.id,
+          productId: r.productId ?? r.product_id ?? null,
+          name: r.name ?? "Untitled",
+          description: r.description ?? "",
+          status: (r.status as any) || "draft",
+          totalLeads: Number(r.totalLeads ?? 0),
+          contactedLeads: Number(r.contactedLeads ?? 0),
+          responses: Number(r.responses ?? 0),
+          conversions: Number(r.conversions ?? 0),
+          createdAt: r.createdAt ?? r.created_at ?? new Date().toISOString(),
+        }));
+        setCampaigns(base);
 
-        // 2) Fallback to client DB service if needed
-        const listViaClient = async (): Promise<Campaign[]> => {
-          const rows = await campaignsService.list(me?.id);
-          return (rows || []).map((r: any) => ({
-            id: r.id,
-            name: r.name,
-            description: r.description ?? "",
-            status: (r.status as Campaign["status"]) || "draft",
-            createdAt: r.createdAt ?? new Date().toISOString(),
-            totalLeads: 0,
-            contactedLeads: 0,
-            responses: 0,
-            conversions: 0,
-          }));
-        };
+        // 2) fetch products (optional)
+        const prods =
+          (await (blink as any).db?.products?.list?.({ where: { userId: me.id }, limit: 200 })) ?? [];
+        setProducts(prods.map((p: any) => ({ id: p.id || p.key, name: p.name })));
 
-        const [listRows, prodRows] = await Promise.all([
-          listViaApi().then((rows) => rows.length ? rows : listViaClient()),
-          ((blink as any).db?.products?.list?.({ where: me?.id ? { userId: me.id } : undefined, limit: 200 }) ?? [])
-        ]);
+        // 3) hydrate with stats from the Netlify function
+        const ids = base.map((c) => c.id).filter(Boolean);
+        if (ids.length) {
+          const res = await fetch(`/api/campaigns?stats=1&ids=${encodeURIComponent(ids.join(","))}`);
+          if (res.ok) {
+            const data = await res.json().catch(() => ({}));
+            const counts = (data?.counts ?? {}) as Record<
+              string,
+              { total?: number; contacted?: number; responses?: number; conversions?: number }
+            >;
 
-        setCampaigns(listRows);
-        setProducts((prodRows || []).map((p: any) => ({ id: p.id || p.key, name: p.name })));
+            setCampaigns((prev) =>
+              prev.map((c) => {
+                const k = counts[c.id] || {};
+                return {
+                  ...c,
+                  totalLeads: Number(k.total ?? c.totalLeads ?? 0),
+                  contactedLeads: Number(k.contacted ?? c.contactedLeads ?? 0),
+                  responses: Number(k.responses ?? c.responses ?? 0),
+                  conversions: Number(k.conversions ?? c.conversions ?? 0),
+                };
+              })
+            );
+          }
+        }
       } finally {
         setLoading(false);
       }
     })();
   }, []);
-
-  // --- stats after campaigns are loaded
-  useEffect(() => {
-    if (!campaigns.length) return;
-    (async () => {
-      try {
-        setLoadingStats(true);
-        const ids = campaigns.map((c) => c.id).filter(Boolean);
-        const res = await fetch(`/api/campaigns?stats=1&ids=${encodeURIComponent(ids.join(","))}`).catch(() => null);
-        if (!res || !res.ok) return;
-        const data = await res.json().catch(() => ({}));
-        const counts = data?.counts || {};
-        // counts should look like { [campaignId]: { total, contacted, responses, conversions } }
-        setCampaigns((prev) =>
-          prev.map((c) => {
-            const s = counts[c.id] || {};
-            return {
-              ...c,
-              totalLeads: Number(s.total ?? s.totalLeads ?? 0),
-              contactedLeads: Number(s.contacted ?? s.contactedLeads ?? 0),
-              responses: Number(s.responses ?? 0),
-              conversions: Number(s.conversions ?? 0),
-            };
-          })
-        );
-      } finally {
-        setLoadingStats(false);
-      }
-    })();
-  }, [campaigns.length]);
 
   const createCampaign = async () => {
     if (!newCampaign.name.trim()) return alert("Enter a name");
@@ -139,57 +118,28 @@ export default function CampaignsPage() {
       productId: newCampaign.product_id,
     });
 
-    const newRow: Campaign = {
+    const row: Campaign = {
       id: created.id,
-      name: created.name,
-      description: created.description ?? "",
-      status: created.status || "draft",
-      createdAt: created.createdAt || new Date().toISOString(),
+      userId: me.id,
+      productId: newCampaign.product_id,
+      name: created.name || newCampaign.name.trim(),
+      description: newCampaign.description.trim(),
+      status: (created.status as any) || "draft",
       totalLeads: 0,
       contactedLeads: 0,
       responses: 0,
       conversions: 0,
+      createdAt: created.createdAt || new Date().toISOString(),
     };
 
-    setCampaigns((prev) => [newRow, ...prev.filter((c) => c.id !== created.id)]);
+    setCampaigns((prev) => [row, ...prev.filter((c) => c.id !== row.id)]);
     setIsCreateDialogOpen(false);
     setNewCampaign({ name: "", description: "", product_id: "" });
-
-    // kick a stats refresh for the single new id
-    try {
-      const res = await fetch(`/api/campaigns?stats=1&ids=${encodeURIComponent(created.id)}`);
-      const data = await res.json().catch(() => ({}));
-      const s = data?.counts?.[created.id] || {};
-      setCampaigns((prev) =>
-        prev.map((c) =>
-          c.id === created.id
-            ? {
-                ...c,
-                totalLeads: Number(s.total ?? 0),
-                contactedLeads: Number(s.contacted ?? 0),
-                responses: Number(s.responses ?? 0),
-                conversions: Number(s.conversions ?? 0),
-              }
-            : c
-        )
-      );
-    } catch {}
   };
-
-  const filtered = useMemo(
-    () =>
-      campaigns.filter(
-        (c) =>
-          c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-          (c.description ?? "").toLowerCase().includes(searchTerm.toLowerCase())
-      ),
-    [campaigns, searchTerm]
-  );
 
   const toggleStatus = (id: string, status: Campaign["status"]) => {
     const next = status === "active" ? "paused" : "active";
     setCampaigns((p) => p.map((c) => (c.id === id ? { ...c, status: next } : c)));
-    // (optional) call a serverless endpoint to persist status if you need
   };
 
   const getStatusBadge = (status: string) => {
@@ -202,6 +152,12 @@ export default function CampaignsPage() {
     const cfg = map[status] || map.draft;
     return <Badge variant={cfg.variant as any}>{cfg.label}</Badge>;
   };
+
+  const filtered = campaigns.filter(
+    (c) =>
+      c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      c.description?.toLowerCase().includes(searchTerm.toLowerCase())
+  );
 
   if (loading) {
     return (
@@ -237,49 +193,66 @@ export default function CampaignsPage() {
               New Campaign
             </Button>
           </DialogTrigger>
-          <DialogContent className="max-w-2xl">
-            <DialogHeader>
-              <DialogTitle>Create New Campaign</DialogTitle>
-              <DialogDescription>Link a product, then create the campaign.</DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4">
-              <div className="grid grid-cols-2 gap-4">
+            <DialogContent className="max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>Create New Campaign</DialogTitle>
+                <DialogDescription>Link a product, then create the campaign.</DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>Campaign Name</Label>
+                    <Input
+                      value={newCampaign.name}
+                      onChange={(e) => setNewCampaign((p) => ({ ...p, name: e.target.value }))}
+                      placeholder="Q4 Outreach"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Product</Label>
+                    <Select
+                      value={newCampaign.product_id}
+                      onValueChange={(v) => setNewCampaign((p) => ({ ...p, product_id: v }))}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select product" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {products.length ? (
+                          products.map((p) => (
+                            <SelectItem key={p.id} value={p.id}>
+                              {p.name}
+                            </SelectItem>
+                          ))
+                        ) : (
+                          <SelectItem value="no" disabled>
+                            No products found
+                          </SelectItem>
+                        )}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
                 <div className="space-y-2">
-                  <Label>Campaign Name</Label>
-                  <Input
-                    value={newCampaign.name}
-                    onChange={(e) => setNewCampaign((p) => ({ ...p, name: e.target.value }))}
-                    placeholder="Q4 Outreach"
+                  <Label>Description</Label>
+                  <Textarea
+                    value={newCampaign.description}
+                    onChange={(e) =>
+                      setNewCampaign((p) => ({ ...p, description: e.target.value }))
+                    }
+                    placeholder="Describe goals and target…"
                   />
                 </div>
-                <div className="space-y-2">
-                  <Label>Product</Label>
-                  <Select value={newCampaign.product_id} onValueChange={(v) => setNewCampaign((p) => ({ ...p, product_id: v }))}>
-                    <SelectTrigger><SelectValue placeholder="Select product" /></SelectTrigger>
-                    <SelectContent>
-                      {products.length ? (
-                        products.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)
-                      ) : (
-                        <SelectItem value="no" disabled>No products found</SelectItem>
-                      )}
-                    </SelectContent>
-                  </Select>
+                <div className="flex justify-end gap-2">
+                  <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>
+                    Cancel
+                  </Button>
+                  <Button onClick={createCampaign} disabled={!newCampaign.name || !newCampaign.product_id}>
+                    Create Campaign
+                  </Button>
                 </div>
               </div>
-              <div className="space-y-2">
-                <Label>Description</Label>
-                <Textarea
-                  value={newCampaign.description}
-                  onChange={(e) => setNewCampaign((p) => ({ ...p, description: e.target.value }))}
-                  placeholder="Describe goals and target…"
-                />
-              </div>
-              <div className="flex justify-end gap-2">
-                <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>Cancel</Button>
-                <Button onClick={createCampaign} disabled={!newCampaign.name || !newCampaign.product_id}>Create Campaign</Button>
-              </div>
-            </div>
-          </DialogContent>
+            </DialogContent>
         </Dialog>
       </div>
 
@@ -287,37 +260,16 @@ export default function CampaignsPage() {
       <div className="flex items-center gap-4">
         <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
-          <Input className="pl-10" placeholder="Search campaigns…" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
+          <Input
+            className="pl-10"
+            placeholder="Search campaigns…"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+          />
         </div>
-        <Button variant="outline" disabled={loadingStats} onClick={() => {
-          // manual refresh stats
-          setCampaigns((prev) => [...prev]); // trigger effect by changing length? do a direct call:
-          (async () => {
-            try {
-              setLoadingStats(true);
-              const ids = campaigns.map((c) => c.id).filter(Boolean);
-              const res = await fetch(`/api/campaigns?stats=1&ids=${encodeURIComponent(ids.join(","))}`);
-              const data = await res.json().catch(() => ({}));
-              const counts = data?.counts || {};
-              setCampaigns((prev) =>
-                prev.map((c) => {
-                  const s = counts[c.id] || {};
-                  return {
-                    ...c,
-                    totalLeads: Number(s.total ?? 0),
-                    contactedLeads: Number(s.contacted ?? 0),
-                    responses: Number(s.responses ?? 0),
-                    conversions: Number(s.conversions ?? 0),
-                  };
-                })
-              );
-            } finally {
-              setLoadingStats(false);
-            }
-          })();
-        }}>
+        <Button variant="outline">
           <Filter className="w-4 h-4 mr-2" />
-          {loadingStats ? "Refreshing…" : "Refresh counts"}
+          Filter
         </Button>
       </div>
 
@@ -335,11 +287,23 @@ export default function CampaignsPage() {
               </div>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm"><MoreHorizontal className="w-4 h-4" /></Button>
+                  <Button variant="ghost" size="sm">
+                    <MoreHorizontal className="w-4 h-4" />
+                  </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem onClick={() => toggleStatus(c.id, c.status)}>
-                    {c.status === "active" ? (<><Pause className="w-4 h-4 mr-2" />Pause</>) : (<><Play className="w-4 h-4 mr-2" />Launch</>)}
+                    {c.status === "active" ? (
+                      <>
+                        <Pause className="w-4 h-4 mr-2" />
+                        Pause
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-4 h-4 mr-2" />
+                        Launch
+                      </>
+                    )}
                   </DropdownMenuItem>
                   <DropdownMenuItem>
                     <BarChart3 className="w-4 h-4 mr-2" />
