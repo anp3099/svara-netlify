@@ -1,3 +1,142 @@
+// Add near imports:
+// import campaignService from "@/services/campaigns";
+
+function AddToCampaignDialog({
+  open,
+  onOpenChange,
+  selectedLeadIds,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  selectedLeadIds: string[];
+}) {
+  const [campaigns, setCampaigns] = React.useState<any[]>([]);
+  const [campaignId, setCampaignId] = React.useState<string>("");
+  const [newName, setNewName] = React.useState("");
+  const [creating, setCreating] = React.useState(false);
+  const [attaching, setAttaching] = React.useState(false);
+
+  React.useEffect(() => {
+    (async () => {
+      const me = await blink.auth.me();
+      const list = await campaignService.list(me.id);
+      setCampaigns(list);
+      if (list.length && !campaignId) setCampaignId(list[0].id);
+    })();
+  }, [open]);
+
+  async function createNow() {
+    if (!newName.trim()) return;
+    try {
+      setCreating(true);
+      const me = await blink.auth.me();
+
+      // pick first product if exists so the campaign is valid
+      const products = await blink.db.products.list({ where: { userId: me.id }, limit: 1 });
+      const productId = products[0]?.id;
+      if (!productId) {
+        alert("Please create a product first (Products tab).");
+        setCreating(false);
+        return;
+      }
+
+      const created = await campaignService.create({
+        userId: me.id,
+        name: newName.trim(),
+        description: "",
+        productId,
+      });
+
+      setCampaigns((p) => [created, ...p]);
+      setCampaignId(created.id);
+      setNewName("");
+    } catch (e: any) {
+      alert(e?.message || "Failed to create campaign");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function attachNow() {
+    if (!campaignId) return alert("Pick a campaign first");
+    if (!selectedLeadIds.length) return alert("No leads selected");
+
+    try {
+      setAttaching(true);
+      const { inserted, skipped } = await campaignService.attachLeads(
+        campaignId,
+        selectedLeadIds
+      );
+      onOpenChange(false);
+      alert(
+        inserted
+          ? `Attached ${inserted} lead(s)${skipped ? `, ${skipped} already attached` : ""}.`
+          : `No rows attached${skipped ? ` (${skipped} already attached)` : ""}.`
+      );
+    } catch (e: any) {
+      alert(e?.message || "Failed to attach leads");
+    } finally {
+      setAttaching(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Add {selectedLeadIds.length} lead{selectedLeadIds.length > 1 ? "s" : ""} to a campaign</DialogTitle>
+          <DialogDescription>Select a campaign or create a new one.</DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-3">
+          <Label>Campaign</Label>
+          <Select value={campaignId} onValueChange={setCampaignId}>
+            <SelectTrigger>
+              <SelectValue placeholder="Choose a campaign" />
+            </SelectTrigger>
+            <SelectContent>
+              {campaigns.length ? (
+                campaigns.map((c) => (
+                  <SelectItem key={c.id} value={c.id}>
+                    {c.name}
+                  </SelectItem>
+                ))
+              ) : (
+                <SelectItem value="none" disabled>
+                  No campaigns yet
+                </SelectItem>
+              )}
+            </SelectContent>
+          </Select>
+
+          <div className="space-y-2">
+            <Label>Create new campaign</Label>
+            <div className="flex gap-2">
+              <Input
+                placeholder="e.g., Q4 Outreach"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+              />
+              <Button onClick={createNow} disabled={!newName || creating}>
+                {creating ? "Creating…" : "Create"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+            <Button onClick={attachNow} disabled={!campaignId || attaching}>
+              {attaching ? "Adding…" : "Add to Campaign"}
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 // src/pages/LeadsDatabase.tsx
 import React, { useEffect, useMemo, useState } from "react"
 import {
