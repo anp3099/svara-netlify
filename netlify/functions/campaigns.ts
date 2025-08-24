@@ -1,11 +1,39 @@
-// Load .env when running locally; harmless on Netlify where env is injected
+// netlify/functions/campaigns.ts
+import type { Handler } from "@netlify/functions";
+
+/* ------------------------- env (local only) ------------------------- */
+// Load .env locally; harmless on Netlify (env is injected)
 try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  require('dotenv').config();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const req: any = (eval as any)("require");
+  req("dotenv").config();
 } catch {}
 
-import type { Handler } from "@netlify/functions";
-import { blink } from "./_blink";
+/* ------------------------- load Blink on server ------------------------ */
+/** Try several require paths; fall back to globalThis.blink. */
+function getBlink(): any {
+  let req: any;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    req = (eval as any)("require");
+  } catch {}
+  const tryPaths = [
+    "../../src/blink/server",
+    "../../src/blink/client",
+    "../../src/lib/blink",
+    "../../lib/blink",
+    "../../../src/lib/blink",
+  ];
+  for (const p of tryPaths) {
+    try {
+      const m = req?.(p);
+      if (m?.blink) return m.blink;
+      if (m?.default) return m.default;
+      if (m) return m;
+    } catch {}
+  }
+  return (globalThis as any).blink ?? null;
+}
 
 /* ---------------------------- tiny helpers ---------------------------- */
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -103,7 +131,8 @@ const getLeadIdFromRow = (r: any) =>
 
 /* -------------------------------- API --------------------------------- */
 export const handler: Handler = async (event) => {
-  const db: any = (blink as any)?.db;
+  const blink = getBlink();
+  const db: any = blink?.db;
 
   // 0) health / debug
   if (event.httpMethod === "GET" && !event.queryStringParameters?.stats && !event.queryStringParameters?.list) {
@@ -187,7 +216,7 @@ export const handler: Handler = async (event) => {
 
   // ensure leads exist (for FK)
   if (leadsKey) {
-    const me = await (blink as any)?.auth?.me?.().catch(() => null);
+    const me = await blink?.auth?.me?.().catch(() => null);
     const leadsTbl: any = db[leadsKey];
     for (const lid of new Set(leadIds)) {
       const candidates = [{ id: lid, userId: me?.id }, { id: lid, user_id: me?.id }, { id: lid }];
