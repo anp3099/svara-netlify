@@ -1,6 +1,11 @@
 // netlify/functions/campaigns.ts
 import type { Handler } from "@netlify/functions";
 
+// ✅ Statically import Blink so the bundler resolves it at build time.
+//    If your project keeps Blink in a different file, change this path to one of:
+//    "../../src/blink/server"  or  "../../src/lib/blink"
+import { blink as clientBlink } from "../../src/blink/client";
+
 /* ---------------------------- tiny helpers ---------------------------- */
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const send = (code: number, body: unknown) => ({
@@ -19,58 +24,9 @@ const get = (obj: any, keys: string[]) => {
   return undefined;
 };
 
-/* ----------------------- Blink discovery (server) ---------------------- */
-/** Try dynamic import first (ESM), then require (CJS). Return blink or null. */
-async function getBlink(): Promise<{ db: any; auth?: any } | null> {
-  const tried: Array<{ path: string; ok: boolean; err?: string }> = [];
-  const candidates = [
-    "../../src/blink/server",
-    "../../src/blink/client",
-    "../../src/lib/blink",
-    "../../lib/blink",
-    "../../../src/lib/blink",
-    "../../src/blink", // in case you export from index.ts
-  ];
-
-  // 1) dynamic import (ESM)
-  for (const p of candidates) {
-    try {
-      const m: any = await import(p);
-      const b = m?.blink ?? m?.default ?? m;
-      if (b?.db) return Object.assign(b, { __debug: { method: "import", path: p } });
-      tried.push({ path: `import:${p}`, ok: false, err: "no blink.db on module" });
-    } catch (e: any) {
-      tried.push({ path: `import:${p}`, ok: false, err: String(e?.message ?? e) });
-    }
-  }
-
-  // 2) require (CJS)
-  try {
-    // eslint-disable-next-line no-eval
-    const req: NodeRequire = (eval as any)("require");
-    for (const p of candidates) {
-      try {
-        const m: any = req(p);
-        const b = m?.blink ?? m?.default ?? m;
-        if (b?.db) return Object.assign(b, { __debug: { method: "require", path: p } });
-        tried.push({ path: `require:${p}`, ok: false, err: "no blink.db on module" });
-      } catch (e: any) {
-        tried.push({ path: `require:${p}`, ok: false, err: String(e?.message ?? e) });
-      }
-    }
-  } catch (e: any) {
-    tried.push({ path: "require:*", ok: false, err: "require unavailable in this runtime" });
-  }
-
-  // 3) global fallback
-  // (useful if you deliberately put blink on globalThis during bootstrap)
-  const gb: any = (globalThis as any).blink;
-  if (gb?.db) return Object.assign(gb, { __debug: { method: "global", path: "globalThis.blink" } });
-
-  // stash tries on the function global so we can return in debug
-  (globalThis as any).__blinkTries = tried;
-  return null;
-}
+/* ------------------------- Blink handle on server --------------------- */
+const blink = clientBlink ?? (globalThis as any).blink ?? null;
+const db: any = blink?.db ?? null;
 
 /* -------------------------- table discovery --------------------------- */
 function findJoinTableKey(db: any): string | null {
@@ -82,14 +38,16 @@ function findJoinTableKey(db: any): string | null {
     "campaignLead",
     "leadCampaign",
   ];
-  for (const k of preferred) if (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function") return k;
-
+  for (const k of preferred) {
+    const t = db?.[k];
+    if (t && (typeof t.create === "function" || typeof t.list === "function")) return k;
+  }
   return (
     keys.find(
       (k) =>
         /campaign/i.test(k) &&
         /lead/i.test(k) &&
-        (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function")
+        (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function"),
     ) ?? null
   );
 }
@@ -146,27 +104,17 @@ function getLeadIdFromRow(r: any): string | undefined {
 
 /* -------------------------------- API --------------------------------- */
 export const handler: Handler = async (event) => {
-  const blink = await getBlink();
-  const db: any = blink?.db;
-
-  /* ---------- Health / debug ---------- */
+  // Health/debug
   if (event.httpMethod === "GET" && event.queryStringParameters?.debug) {
     return send(200, {
       ok: true,
-      path: event.path,
-      rawUrl: (event as any).rawUrl ?? null,
-      env: {
-        node: process.version,
-        isServer: typeof window === "undefined",
-        importMetaUrl: (import.meta as any)?.url ?? null,
-      },
-      debug: blink?.__debug ?? null,
+      path: "/api/campaigns",
       tables: db ? Object.keys(db) : [],
-      tried: (globalThis as any).__blinkTries ?? [],
+      debug: [{ resolved: Boolean(clientBlink), note: "static import ../../src/blink/client" }],
     });
   }
 
-  /* ---------- LIST campaigns with IDs ---------- */
+  // LIST campaigns with IDs (server-side)
   if (event.httpMethod === "GET" && event.queryStringParameters?.list) {
     if (!db) return send(200, { ok: false, reason: "DB unavailable on server", rows: [] });
 
@@ -175,14 +123,7 @@ export const handler: Handler = async (event) => {
 
     const rows = (await db[cKey].list?.({ orderBy: { createdAt: "desc" }, limit: 100 })) ?? [];
     const norm = (r: any) => ({
-      id:
-        r?.id ??
-        r?.key ??
-        r?._id ??
-        r?.uuid ??
-        r?.campaignId ??
-        r?.campaign_id ??
-        null,
+      id: r?.id ?? r?.key ?? r?._id ?? r?.uuid ?? r?.campaignId ?? r?.campaign_id ?? null,
       name: r?.name ?? r?.title ?? "Untitled",
       createdAt: r?.createdAt ?? r?.created_at ?? null,
       raw: r,
@@ -190,7 +131,7 @@ export const handler: Handler = async (event) => {
     return send(200, { ok: true, rows: rows.map(norm), table: cKey });
   }
 
-  /* ---------- STATS counts per campaign ---------- */
+  // STATS counts per campaign
   if (event.httpMethod === "GET" && event.queryStringParameters?.stats) {
     const idsRaw = event.queryStringParameters?.ids ?? "";
     const ids = idsRaw.split(",").map((s) => s.trim()).filter(Boolean);
@@ -199,12 +140,10 @@ export const handler: Handler = async (event) => {
 
     const joinKey = findJoinTableKey(db);
     const leadsKey = findLeadsTableKey(db);
-
     const counts: Record<string, number> = Object.fromEntries(ids.map((id) => [id, 0]));
 
     if (joinKey) {
-      const join = db[joinKey];
-      const rows = (await join.list?.({ limit: 10000 })) ?? [];
+      const rows = (await db[joinKey].list?.({ limit: 10000 })) ?? [];
       for (const r of rows) {
         const cid = getCampaignIdFromRow(r);
         const lid = getLeadIdFromRow(r);
@@ -214,8 +153,7 @@ export const handler: Handler = async (event) => {
     }
 
     if (leadsKey) {
-      const leads = db[leadsKey];
-      const rows = (await leads.list?.({ limit: 10000 })) ?? [];
+      const rows = (await db[leadsKey].list?.({ limit: 10000 })) ?? [];
       for (const r of rows) {
         const cid = getCampaignIdFromRow(r);
         if (cid && cid in counts) counts[cid] += 1;
@@ -223,14 +161,18 @@ export const handler: Handler = async (event) => {
       return send(200, { ok: true, counts, joinKey, leadsKey });
     }
 
-    return send(200, { ok: true, counts: {}, reason: "no-join-or-leads", joinKey, leadsKey });
+    return send(200, { ok: true, counts: {}, reason: "no-join-or-leads" });
   }
 
-  /* ---------- ATTACH leads to a campaign ---------- */
+  // ATTACH leads
   if (event.httpMethod !== "POST") return send(405, { error: "Method not allowed" });
 
   const body = (() => {
-    try { return JSON.parse(event.body || "{}"); } catch { return {}; }
+    try {
+      return JSON.parse(event.body || "{}");
+    } catch {
+      return {};
+    }
   })();
 
   const campaignId = event.queryStringParameters?.id ?? body?.campaignId ?? null;
@@ -244,7 +186,7 @@ export const handler: Handler = async (event) => {
   const joinKey = findJoinTableKey(db);
   const leadsKey = findLeadsTableKey(db);
 
-  // Make sure leads exist (helps with FK constraints)
+  // Make sure leads exist (useful for FK constraints)
   if (leadsKey) {
     const me = await blink?.auth?.me?.().catch(() => null);
     const leadsTbl: any = db[leadsKey];
@@ -267,22 +209,38 @@ export const handler: Handler = async (event) => {
     }
   }
 
-  let inserted = 0, skipped = 0;
+  let inserted = 0,
+    skipped = 0;
 
-  // 1) Preferred: join table
+  // Prefer join table
   if (joinKey) {
     const join = db[joinKey];
     const campaignFields = ["campaignId", "campaign_id", "campaign", "campaignID", "campaignid", "campaignKey"];
     const leadFields = [
-      "leadId","lead_id","lead","leadKey","lead_key",
-      "contactId","contact_id","prospectId","prospect_id","personId","person_id","recordId","record_id",
+      "leadId",
+      "lead_id",
+      "lead",
+      "leadKey",
+      "lead_key",
+      "contactId",
+      "contact_id",
+      "prospectId",
+      "prospect_id",
+      "personId",
+      "person_id",
+      "recordId",
+      "record_id",
     ];
 
-    const tryCreate = async (lid: string): Promise<"ok"|"dup"|"fail"> => {
+    const tryCreate = async (lid: string): Promise<"ok" | "dup" | "fail"> => {
       for (const ck of campaignFields) {
         for (const lk of leadFields) {
-          try { await join.create({ [ck]: campaignId, [lk]: lid }); return "ok"; }
-          catch (e) { if (isDup(e)) return "dup"; /* else keep trying */ }
+          try {
+            await join.create({ [ck]: campaignId, [lk]: lid });
+            return "ok";
+          } catch (e) {
+            if (isDup(e)) return "dup";
+          }
         }
       }
       if (typeof join.upsert === "function") {
@@ -293,38 +251,54 @@ export const handler: Handler = async (event) => {
             create: { campaignId, leadId: lid },
           });
           return "ok";
-        } catch (e) { if (isDup(e)) return "dup"; }
+        } catch (e) {
+          if (isDup(e)) return "dup";
+        }
       }
       return "fail";
     };
 
     for (const lid of new Set(leadIds)) {
       const r = await tryCreate(lid);
-      if (r === "ok") inserted++; else if (r === "dup") skipped++;
+      if (r === "ok") inserted++;
+      else if (r === "dup") skipped++;
     }
+
     return send(200, { inserted, skipped, debug: { joinKey, leadsKey, dbKeys } } as AttachResult);
   }
 
-  // 2) Fallback: stamp campaignId onto the lead rows
+  // Fallback: write campaignId onto leads
   if (leadsKey) {
     const leadsTbl: any = db[leadsKey];
     const candidates = ["campaignId", "campaign_id", "campaign", "campaignKey"];
 
-    const updateOne = async (lid: string): Promise<"ok"|"dup"|"fail"> => {
+    const updateOne = async (lid: string): Promise<"ok" | "dup" | "fail"> => {
       for (const f of candidates) {
         const patch = { [f]: campaignId };
         try {
-          if (typeof leadsTbl.update === "function") { await leadsTbl.update(lid, patch); return "ok"; }
-          if (typeof leadsTbl.patch === "function")  { await leadsTbl.patch(lid, patch);  return "ok"; }
-          if (typeof leadsTbl.upsert === "function") { await leadsTbl.upsert({ where: { id: lid }, update: patch, create: { id: lid, ...patch } }); return "ok"; }
-        } catch (e) { if (isDup(e)) return "dup"; }
+          if (typeof leadsTbl.update === "function") {
+            await leadsTbl.update(lid, patch);
+            return "ok";
+          }
+          if (typeof leadsTbl.patch === "function") {
+            await leadsTbl.patch(lid, patch);
+            return "ok";
+          }
+          if (typeof leadsTbl.upsert === "function") {
+            await leadsTbl.upsert({ where: { id: lid }, update: patch, create: { id: lid, ...patch } });
+            return "ok";
+          }
+        } catch (e) {
+          if (isDup(e)) return "dup";
+        }
       }
       return "fail";
     };
 
     for (const lid of new Set(leadIds)) {
       const r = await updateOne(lid);
-      if (r === "ok") inserted++; else if (r === "dup") skipped++;
+      if (r === "ok") inserted++;
+      else if (r === "dup") skipped++;
     }
 
     return send(200, { inserted, skipped, debug: { joinKey, leadsKey, dbKeys } } as AttachResult);
