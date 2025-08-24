@@ -30,6 +30,14 @@
   status = 200
   force  = true
 
+  [[redirects]]
+  from   = "/api/leads/*"
+  to     = "/.netlify/functions/leads"
+  status = 200
+  force  = true
+
+# (Keep your generic /api/* -> functions and SPA fallback below these)
+
 # (Optional) quick health probe
 [[redirects]]
   from   = "/api/_health"
@@ -56,3 +64,9 @@
   from   = "/*"
   to     = "/index.html"
   status = 200
+
+  # Helpful while iterating: ensure the function isn't cached by the CDN
+[[headers]]
+  for = "/.netlify/functions/leads"
+  [headers.values]
+  Cache-Control = "no-store"
