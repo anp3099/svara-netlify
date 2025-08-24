@@ -7,16 +7,23 @@
 [functions]
   directory    = "netlify/functions"
   node_bundler = "esbuild"
+
+  # Copy your Blink source into the function zip (for dynamic import)
   included_files = [
     "src/blink/**",
     "src/lib/**"
   ]
 
+  # NEW: ensure node modules used by your Blink code are available at runtime
+  # (add more here if your Blink file imports other libs)
+  external_node_modules = ["@blinkdotnew/sdk"]
+
 [build.environment]
   NODE_VERSION = "22.12.0"
 
 # --- Redirects (order matters!) ---
-# Force /api/leads to the Netlify function (no SPA route interference)
+
+# Force /api/leads to the Netlify function (no SPA interference)
 [[redirects]]
   from   = "/api/leads"
   to     = "/.netlify/functions/leads"
@@ -30,21 +37,21 @@
   status = 200
   force  = true
 
-# 1) Canonical attach endpoint — pass :id as a query param to the function
+# Canonical attach endpoint
 [[redirects]]
   from   = "/api/campaigns/:id/leads"
   to     = "/.netlify/functions/campaigns?id=:id"
   status = 200
   force  = true
 
-# 2) Generic /api/* → serverless functions
+# Generic /api/* → functions
 [[redirects]]
   from   = "/api/*"
   to     = "/.netlify/functions/:splat"
   status = 200
   force  = true
 
-# 3) SPA fallback
+# SPA fallback (keep this last)
 [[redirects]]
   from   = "/*"
   to     = "/index.html"
