@@ -9,11 +9,6 @@ const send = (code: number, body: unknown) => ({
   body: JSON.stringify(body),
 });
 
-const get = (obj: any, keys: string[]) => {
-  for (const k of keys) if (obj && k in obj) return obj[k];
-  return undefined;
-};
-
 /* ------------------------- load Blink on server ------------------------ */
 /** Try several require paths; fall back to globalThis.blink. */
 function getBlink(): any {
@@ -70,69 +65,46 @@ function findLeadsTableKey(db: any): string | null {
   );
 }
 
-function getLeadIdFromRow(r: any): string | undefined {
-  return (
-    get(r, ["id", "key", "_id", "uuid"]) ??
-    get(r, ["leadId", "lead_id", "lead", "leadKey", "lead_key"]) ??
-    get(r, ["contactId", "contact_id"]) ??
-    get(r, ["prospectId", "prospect_id"]) ??
-    get(r, ["personId", "person_id"]) ??
-    get(r, ["recordId", "record_id"])
-  );
-}
-
-/* -------------------------------- API --------------------------------- */
+/* ------------------------------ handler ------------------------------- */
 export const handler: Handler = async (event) => {
+  if (event.httpMethod !== "GET") {
+    return send(405, { ok: false, error: "Method not allowed" });
+  }
+
   const blink = getBlink();
   const db: any = blink?.db;
 
-  // health
-  if (event.httpMethod === "GET" && !event.queryStringParameters?.limit && !event.queryStringParameters?.ids) {
-    return send(200, {
-      ok: true,
-      path: event.path,
-      tables: db ? Object.keys(db) : [],
-    });
+  if (!db) {
+    return send(200, { ok: false, reason: "DB unavailable on server", rows: [] });
   }
 
-  if (event.httpMethod !== "GET") {
-    return send(405, { error: "Method not allowed" });
+  const leadsKey = findLeadsTableKey(db);
+  if (!leadsKey) {
+    return send(200, { ok: true, reason: "no-leads-table", rows: [] });
   }
 
-  if (!db) return send(200, { ok: false, reason: "DB unavailable on server", rows: [] });
+  const limit = Math.max(
+    1,
+    Math.min( Number(event.queryStringParameters?.limit ?? 20) || 20, 200)
+  );
 
-  // allow forcing a table via ?table=xxx (optional)
-  const forcedKey = event.queryStringParameters?.table ?? null;
-  const leadsKey = forcedKey || findLeadsTableKey(db);
-  if (!leadsKey) return send(200, { ok: true, rows: [], table: null, reason: "no-leads-table" });
+  // Pull some leads
+  const rawRows =
+    (await db[leadsKey].list?.({ limit })) ??
+    [];
 
-  const limit = Math.max(1, Math.min(100, Number(event.queryStringParameters?.limit ?? 20)));
-  const q = (event.queryStringParameters?.q ?? "").trim();
-
-  // list a small page of leads
-  const rows = (await db[leadsKey].list?.({ limit })) ?? [];
-
-  // normalize a few fields and (optionally) filter by q client-side
-  const norm = (r: any) => ({
-    id: getLeadIdFromRow(r) ?? null,
-    name: r?.fullName ?? r?.name ?? r?.company ?? r?.email ?? "(no name)",
-    email: r?.email ?? null,
-    company: r?.company ?? null,
-    createdAt: r?.createdAt ?? r?.created_at ?? null,
+  // Normalize a few common fields so the UI/snippets are predictable
+  const rows = rawRows.map((r: any) => ({
+    id: r?.id ?? r?.key ?? r?._id ?? r?.uuid ?? r?.email ?? null,
+    name: r?.name ?? r?.fullName ?? r?.full_name ?? r?.company ?? r?.email ?? "(no name)",
+    email:
+      r?.email ??
+      r?.workEmail ?? r?.work_email ??
+      r?.businessEmail ?? r?.business_email ??
+      r?.personalEmail ?? r?.personal_email ??
+      r?.contact_email ?? null,
     raw: r,
-  });
+  }));
 
-  let out = rows.map(norm).filter((x: any) => x.id);
-  if (q) {
-    const needle = q.toLowerCase();
-    out = out.filter(
-      (x: any) =>
-        String(x.name ?? "").toLowerCase().includes(needle) ||
-        String(x.email ?? "").toLowerCase().includes(needle) ||
-        String(x.company ?? "").toLowerCase().includes(needle) ||
-        String(x.id).toLowerCase().includes(needle)
-    );
-  }
-
-  return send(200, { ok: true, rows: out, table: leadsKey });
+  return send(200, { ok: true, table: leadsKey, rows });
 };
