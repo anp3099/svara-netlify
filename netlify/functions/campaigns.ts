@@ -1,3 +1,9 @@
+// Load .env when running locally; harmless on Netlify where env is injected
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  require('dotenv').config();
+} catch {}
+
 import type { Handler } from "@netlify/functions";
 import { blink } from "./_blink";
 
