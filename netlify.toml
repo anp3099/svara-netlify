@@ -16,6 +16,12 @@
   NODE_VERSION = "22.12.0"
 
 # --- Redirects (order matters!) ---
+# Force /api/leads to the Netlify function (no SPA route interference)
+[[redirects]]
+  from   = "/api/leads"
+  to     = "/.netlify/functions/leads"
+  status = 200
+  force  = true
 
 # (Optional) quick health probe
 [[redirects]]
