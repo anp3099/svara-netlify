@@ -1,12 +1,28 @@
 // netlify/functions/leads.ts
 import type { Handler } from "@netlify/functions";
-import { getBlink, blinkDebug } from "./_blink";
 
-/* load .env locally; harmless on Netlify */
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  require("dotenv").config();
-} catch {}
+/* Load .env locally; harmless on Netlify */
+try { (eval as any)("require")("dotenv").config(); } catch {}
+
+/* Resolve blink from several possible build paths or global */
+function getBlink(): any {
+  let req: any; try { req = (eval as any)("require"); } catch {}
+  for (const p of [
+    "../../src/blink/server",
+    "../../src/blink/client",
+    "../../src/lib/blink",
+    "../../lib/blink",
+    "../../../src/lib/blink",
+  ]) {
+    try {
+      const m = req?.(p);
+      if (m?.blink) return m.blink;
+      if (m?.default) return m.default;
+      if (m) return m;
+    } catch {}
+  }
+  return (globalThis as any).blink ?? null;
+}
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const send = (code: number, body: unknown) => ({
@@ -15,123 +31,74 @@ const send = (code: number, body: unknown) => ({
   body: JSON.stringify(body),
 });
 
-// --- table discovery ---
+const prefers = [
+  "leads","lead","contacts","prospects","people","persons","records",
+  "realLeadDatabase","leadDatabase","realLeads",
+];
+
 function findLeadsTableKey(db: any): string | null {
   const keys = Object.keys(db || {});
-  const preferred = [
-    "leads",
-    "lead",
-    "contacts",
-    "prospects",
-    "people",
-    "persons",
-    "records",
-    "realLeadDatabase",
-    "leadDatabase",
-    "realLeads",
-  ];
-  for (const k of preferred) {
+  for (const k of prefers) {
     const t = db?.[k];
     if (t && typeof t.list === "function") return k;
   }
-  return (
-    keys.find(
-      (k) =>
-        /lead|contact|prospect|people|person|record/i.test(k) &&
-        typeof db?.[k]?.list === "function"
-    ) ?? null
-  );
+  return keys.find(k => /lead|contact|prospect|people|person|record/i.test(k) && typeof db?.[k]?.list === "function") ?? null;
 }
 
-// --- normalizer used by UI/tests ---
-function normRow(r: any) {
+/** Some stores return { key, value }; unwrap to value if present. */
+const unbox = (r: any) => (r && typeof r === "object" && "value" in r && Object.keys(r).length <= 2 ? r.value : r);
+
+/** Normalize any row shape to the table expects. */
+function normRow(row: any) {
+  const r = unbox(row) ?? {};
+  const id =
+    r.id ?? r.key ?? r._id ?? r.uuid ??
+    r.email ?? r.workEmail ?? r.businessEmail ?? null;
+
   return {
-    id: r?.id ?? r?.key ?? r?._id ?? r?.uuid ?? null,
-    company:
-      r?.company ?? r?.companyName ?? r?.org ?? r?.business ?? r?.account ?? null,
-    name:
-      r?.name ??
-      r?.fullName ??
-      r?.full_name ??
-      r?.contact ??
-      r?.person ??
-      r?.firstName && r?.lastName
-        ? `${r.firstName} ${r.lastName}`.trim()
-        : null,
-    email:
-      r?.email ??
-      r?.workEmail ??
-      r?.businessEmail ??
-      r?.work_email ??
-      r?.business_email ??
-      null,
-    industry: r?.industry ?? r?.vertical ?? null,
-    size: r?.size ?? r?.companySize ?? r?.employees ?? null,
-    revenue: r?.revenue ?? r?.annualRevenue ?? null,
-    location: r?.location ?? r?.city ?? r?.region ?? r?.state ?? null,
-    score: r?.score ?? r?.fit ?? 0,
+    id,
+    company: r.company ?? r.companyName ?? r.org ?? r.business ?? r.organization ?? null,
+    name: r.name ?? r.fullName ?? r.full_name ?? r.contact ?? r.person ?? r.firstName && r.lastName ? `${r.firstName} ${r.lastName}` : null,
+    email: r.email ?? r.workEmail ?? r.businessEmail ?? r.work_email ?? r.business_email ?? null,
+    industry: r.industry ?? r.vertical ?? null,
+    size: r.size ?? r.companySize ?? r.employees ?? r.employeeCount ?? null,
+    revenue: r.revenue ?? r.annualRevenue ?? r.annual_revenue ?? null,
+    location: r.location ?? r.city ?? r.region ?? r.state ?? r.country ?? null,
+    score: r.score ?? r.fit ?? 0,
     raw: r,
   };
 }
 
 export const handler: Handler = async (event) => {
-  // -------- health / debug ----------
-  if (event.httpMethod === "GET" && event.queryStringParameters?.debug) {
-    const dbg = await blinkDebug();
-    return send(200, {
-      ok: true,
-      path: "/.netlify/functions/leads",
-      matchedFn: "Leads",
-      ...dbg,
-    });
+  const blink = getBlink();
+  const db: any = blink?.db;
+
+  // Debug: prove this is the function and whether we see a DB
+  if (event.queryStringParameters?.debug) {
+    const matchedFn = "leads";
+    const hasDb = !!db;
+    const keys = hasDb ? Object.keys(db) : [];
+    return send(200, { ok: true, path: event.path, matchedFn, hasDb, keys });
   }
 
-  if (event.httpMethod !== "GET") {
-    return send(405, { error: "Method not allowed" });
-  }
-
-  const blink = await getBlink();
-  const db: any = (blink as any)?.db;
-
-  if (!db) {
-    // Still give a correctly shaped response so the UI won’t explode
-    return send(200, {
-      ok: true,
-      store: "Leads",
-      items: [],
-      cursor: null,
-      counters: {},
-      reason: "db-unavailable",
-    });
-  }
+  if (event.httpMethod !== "GET") return send(405, { error: "Method not allowed" });
+  if (!db) return send(200, { ok: false, rows: [], reason: "db-unavailable" });
 
   const leadsKey = findLeadsTableKey(db);
-  if (!leadsKey) {
-    return send(200, {
-      ok: true,
-      store: "Leads",
-      items: [],
-      cursor: null,
-      counters: {},
-      reason: "leads-table-not-found",
-      keys: Object.keys(db || {}),
-    });
+  if (!leadsKey) return send(200, { ok: true, rows: [], table: null });
+
+  const limit = Math.min(parseInt(event.queryStringParameters?.limit || "50", 10) || 50, 200);
+
+  // Try the primary list() call
+  let rows: any[] = (await db[leadsKey].list?.({ limit })) ?? [];
+
+  // If the table is KV-ish and returned `{ store, items }`, unwrap that too.
+  // (Some Blink adapters do this.)
+  if (!Array.isArray(rows) && rows?.items && Array.isArray(rows.items)) {
+    rows = rows.items;
   }
 
-  const limit = Math.min(
-    parseInt(event.queryStringParameters?.limit || "50", 10) || 50,
-    200
-  );
+  const out = rows.map(normRow).filter(x => x.id);
 
-  const rows = (await db[leadsKey].list?.({ limit })) ?? [];
-
-  // Return in the same “shape” your front-end already consumes when it calls /api/leads
-  return send(200, {
-    ok: true,
-    store: "Leads",
-    items: rows.map(normRow),
-    cursor: null,
-    counters: { returned: rows.length },
-    table: leadsKey,
-  });
+  return send(200, { ok: true, rows: out, table: leadsKey, count: out.length });
 };
