@@ -1,5 +1,6 @@
 // netlify/functions/campaigns.ts
 import type { Handler } from "@netlify/functions";
+import path from "node:path";
 
 /* ---------------------------- tiny helpers ---------------------------- */
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -20,29 +21,62 @@ const get = (obj: any, keys: string[]) => {
 };
 
 /* ------------------------- load Blink on server ------------------------ */
-/** Try several require paths; fall back to globalThis.blink. */
+/** Try absolute & relative require paths; fall back to globalThis.blink. */
+let _blink: any | null = null;
 function getBlink(): any {
+  if (_blink) return _blink;
+
   let req: any;
   try {
     // eslint-disable-next-line no-eval
     req = (eval as any)("require");
-  } catch {}
-  const tryPaths = [
+  } catch {
+    req = undefined;
+  }
+
+  const rootsAbs = [
+    path.join(process.cwd(), "src/blink/server"),
+    path.join(process.cwd(), "src/blink/client"),
+    path.join(process.cwd(), "src/lib/blink"),
+    path.join(process.cwd(), "lib/blink"),
+  ];
+
+  const rootsRel = [
     "../../src/blink/server",
     "../../src/blink/client",
     "../../src/lib/blink",
     "../../lib/blink",
     "../../../src/lib/blink",
   ];
-  for (const p of tryPaths) {
+
+  const tryLoad = (p: string) => {
     try {
-      const m = req(p);
-      if (m?.blink) return m.blink;
-      if (m?.default) return m.default;
-      return m;
-    } catch {}
+      const m = req?.(p);
+      return m?.blink ?? m?.default ?? m ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  for (const p of rootsAbs) {
+    const b = tryLoad(p);
+    if (b) {
+      _blink = b;
+      return _blink;
+    }
   }
-  return (globalThis as any).blink ?? null;
+  for (const p of rootsRel) {
+    const b = tryLoad(p);
+    if (b) {
+      _blink = b;
+      return _blink;
+    }
+  }
+
+  // fallback to global injection (rare)
+  // @ts-ignore
+  _blink = (globalThis as any).blink ?? null;
+  return _blink;
 }
 
 /* -------------------------- table discovery --------------------------- */
@@ -55,14 +89,15 @@ function findJoinTableKey(db: any): string | null {
     "campaignLead",
     "leadCampaign",
   ];
-  for (const k of preferred) if (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function") return k;
+  for (const k of preferred)
+    if (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function") return k;
 
   return (
     keys.find(
       (k) =>
         /campaign/i.test(k) &&
         /lead/i.test(k) &&
-        (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function")
+        (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function"),
     ) ?? null
   );
 }
@@ -100,9 +135,7 @@ function findCampaignsTableKey(db: any): string | null {
   const keys = Object.keys(db || {});
   const preferred = ["campaigns", "campaign"];
   for (const k of preferred) if (typeof db?.[k]?.list === "function") return k;
-  return (
-    keys.find((k) => /campaign/i.test(k) && typeof db?.[k]?.list === "function") ?? null
-  );
+  return keys.find((k) => /campaign/i.test(k) && typeof db?.[k]?.list === "function") ?? null;
 }
 
 /* ------------------------------ counting ------------------------------ */
@@ -176,7 +209,6 @@ export const handler: Handler = async (event) => {
     // Prefer join table if present
     if (joinKey) {
       const join = db[joinKey];
-      // pull a reasonable amount; adjust if your dataset is larger
       const rows = (await join.list?.({ limit: 10000 })) ?? [];
       for (const r of rows) {
         const cid = getCampaignIdFromRow(r);
@@ -212,11 +244,7 @@ export const handler: Handler = async (event) => {
   })();
 
   // campaignId may be in query or body
-  const campaignId =
-    event.queryStringParameters?.id ??
-    body?.campaignId ??
-    null;
-
+  const campaignId = event.queryStringParameters?.id ?? body?.campaignId ?? null;
   const leadIds: string[] = Array.isArray(body?.leadIds) ? body.leadIds.filter(Boolean) : [];
 
   if (!campaignId) return send(400, { error: "campaignId missing" });
@@ -230,7 +258,7 @@ export const handler: Handler = async (event) => {
 
   // Ensure leads exist if we can (useful for FK constraints)
   if (leadsKey) {
-    const me = await blink.auth?.me?.().catch(() => null);
+    const me = await blink?.auth?.me?.().catch(() => null);
     const leadsTbl: any = db[leadsKey];
     for (const lid of new Set(leadIds)) {
       const candidates = [{ id: lid, userId: me?.id }, { id: lid, user_id: me?.id }, { id: lid }];
@@ -251,8 +279,8 @@ export const handler: Handler = async (event) => {
     }
   }
 
-  let inserted = 0,
-    skipped = 0;
+  let inserted = 0;
+  let skipped = 0;
 
   // 1) Join table path
   if (joinKey) {
@@ -347,5 +375,10 @@ export const handler: Handler = async (event) => {
     return send(200, { inserted, skipped, debug: { joinKey, leadsKey, dbKeys } } as AttachResult);
   }
 
-  return send(200, { inserted: 0, skipped: 0, reason: "No suitable join/leads table discovered", debug: { dbKeys } });
+  return send(200, {
+    inserted: 0,
+    skipped: 0,
+    reason: "No suitable join/leads table discovered",
+    debug: { dbKeys },
+  });
 };
