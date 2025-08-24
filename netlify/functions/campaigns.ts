@@ -1,9 +1,7 @@
 // netlify/functions/campaigns.ts
 import type { Handler } from "@netlify/functions";
 
-/* ------------------------------------------------------------------ */
-/* Small helpers                                                       */
-/* ------------------------------------------------------------------ */
+/* ---------------------------- tiny helpers ---------------------------- */
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const send = (code: number, body: unknown) => ({
   statusCode: code,
@@ -26,52 +24,61 @@ const get = (obj: any, keys: string[]) => {
   return undefined;
 };
 
-/* ------------------------------------------------------------------ */
-/* Load Blink on the server (try several common paths)                 */
-/* ------------------------------------------------------------------ */
-function getBlink(): any {
+/* ------------------------- load Blink on server ------------------------ */
+/** Try several paths relative to THIS file (netlify/functions). */
+function getBlink(debug: boolean) {
+  const attempts: { path: string; ok: boolean; note?: string }[] = [];
+  let blink: any = null;
+
+  // safe "require" (CommonJS) in Netlify func env
   let req: any;
   try {
     // eslint-disable-next-line no-eval
     req = (eval as any)("require");
   } catch {
-    req = undefined;
+    attempts.push({ path: "<eval require>", ok: false, note: "eval(require) not available" });
   }
 
   const tryPaths = [
-    // typical “server” entry
-    "../../src/blink/server",
-    "../../../src/blink/server",
+    // ✅ most likely when functions live in netlify/functions and app code is under src/...
+    "../src/blink/server",
+    "../src/blink/client",
+    "../src/lib/blink",
 
-    // app-local client/server shims
+    // other fallbacks that sometimes show up depending on bundler
+    "../../src/blink/server",
     "../../src/blink/client",
-    "../../../src/blink/client",
     "../../src/lib/blink",
-    "../../../src/lib/blink",
-    "../../lib/blink",
-    "../../../lib/blink",
+    "./blink",
+    "@/_blink/server",
+    "@/_blink/client",
+    "@/blink/server",
+    "@/blink/client",
+    "@/lib/blink",
   ];
 
-  if (req) {
-    for (const p of tryPaths) {
-      try {
-        const m = req(p);
-        if (m?.blink) return m.blink;
-        if (m?.default) return m.default;
-        return m;
-      } catch {
-        // keep trying
-      }
+  for (const p of tryPaths) {
+    if (!req) continue;
+    try {
+      const m = req(p);
+      blink = m?.blink ?? m?.default ?? m ?? null;
+      attempts.push({ path: p, ok: !!blink });
+      if (blink) break;
+    } catch (e: any) {
+      attempts.push({ path: p, ok: false, note: String(e?.message ?? e) });
     }
   }
 
-  // last resort: something put it on globalThis
-  return (globalThis as any).blink ?? null;
+  if (!blink) {
+    // very last resort – maybe someone pinned it on globalThis
+    blink = (globalThis as any).blink ?? null;
+    attempts.push({ path: "globalThis.blink", ok: !!blink });
+  }
+
+  return { blink, attempts: debug ? attempts : undefined };
 }
 
-/* ------------------------------------------------------------------ */
-/* Table discovery                                                     */
-/* ------------------------------------------------------------------ */
+/* -------------------------- table discovery --------------------------- */
 function findJoinTableKey(db: any): string | null {
   const keys = Object.keys(db || {});
   const preferred = [
@@ -82,18 +89,15 @@ function findJoinTableKey(db: any): string | null {
     "leadCampaign",
   ];
   for (const k of preferred) {
-    const t = db?.[k];
-    if (t && (typeof t.create === "function" || typeof t.list === "function")) return k;
+    if (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function") return k;
   }
   return (
-    keys.find((k) => {
-      const t = db?.[k];
-      return (
+    keys.find(
+      (k) =>
         /campaign/i.test(k) &&
         /lead/i.test(k) &&
-        (typeof t?.create === "function" || typeof t?.list === "function")
-      );
-    }) ?? null
+        (typeof db?.[k]?.create === "function" || typeof db?.[k]?.list === "function")
+    ) ?? null
   );
 }
 
@@ -133,9 +137,7 @@ function findCampaignsTableKey(db: any): string | null {
   return keys.find((k) => /campaign/i.test(k) && typeof db?.[k]?.list === "function") ?? null;
 }
 
-/* ------------------------------------------------------------------ */
-/* Normalizers                                                         */
-/* ------------------------------------------------------------------ */
+/* ------------------------------ counting ------------------------------ */
 function getCampaignIdFromRow(r: any): string | undefined {
   return get(r, ["campaignId", "campaign_id", "campaign", "campaignID", "campaignid", "campaignKey"]);
 }
@@ -149,39 +151,29 @@ function getLeadIdFromRow(r: any): string | undefined {
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* Handler                                                             */
-/* ------------------------------------------------------------------ */
+/* -------------------------------- API --------------------------------- */
 export const handler: Handler = async (event) => {
-  const blink = getBlink();
+  const debug = !!event.queryStringParameters?.debug;
+  const { blink, attempts } = getBlink(debug);
   const db: any = blink?.db;
 
-  const qs = event.queryStringParameters || {};
-  const method = event.httpMethod.toUpperCase();
-  const wantDebug = "debug" in qs;
-
-  /* ----------------------- Health / Debug (GET) ---------------------- */
-  if (method === "GET" && !qs.stats && !qs.list) {
+  // Health (and quick debug)
+  if (event.httpMethod === "GET" && !event.queryStringParameters?.stats && !event.queryStringParameters?.list) {
     return send(200, {
       ok: true,
       path: event.path,
-      rawUrl: (event as any).rawUrl ?? null,
       tables: db ? Object.keys(db) : [],
+      debug: attempts,
     });
   }
 
-  /* ----------------------- LIST campaigns (GET) ---------------------- */
-  if (method === "GET" && qs.list) {
-    if (!db) return send(200, { ok: false, reason: "DB unavailable on server", rows: [] });
+  // LIST campaigns with IDs (server-side)
+  if (event.httpMethod === "GET" && event.queryStringParameters?.list) {
+    if (!db) return send(200, { ok: false, reason: "DB unavailable on server", rows: [], debug: attempts });
     const cKey = findCampaignsTableKey(db);
-    if (!cKey) return send(200, { ok: true, rows: [], table: null });
+    if (!cKey) return send(200, { ok: true, rows: [], table: null, debug: attempts });
 
-    const rows =
-      (await db[cKey].list?.({
-        orderBy: { createdAt: "desc" },
-        limit: 100,
-      })) ?? [];
-
+    const rows = (await db[cKey].list?.({ orderBy: { createdAt: "desc" }, limit: 100 })) ?? [];
     const norm = (r: any) => ({
       id:
         r?.id ??
@@ -193,52 +185,50 @@ export const handler: Handler = async (event) => {
         null,
       name: r?.name ?? r?.title ?? "Untitled",
       createdAt: r?.createdAt ?? r?.created_at ?? null,
-      raw: wantDebug ? r : undefined,
+      raw: r,
     });
-
-    return send(200, { ok: true, rows: rows.map(norm), table: cKey });
+    return send(200, { ok: true, rows: rows.map(norm), table: cKey, debug: attempts });
   }
 
-  /* ------------------- STATS per campaign (GET) ---------------------- */
-  if (method === "GET" && qs.stats) {
-    const ids = String(qs.ids || "")
+  // STATS counts per campaign
+  if (event.httpMethod === "GET" && event.queryStringParameters?.stats) {
+    const ids = String(event.queryStringParameters?.ids ?? "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-
     if (!ids.length) return send(200, { ok: true, counts: {}, reason: "no-ids" });
-    if (!db) return send(200, { ok: true, counts: {}, reason: "db-unavailable" });
+
+    if (!db) return send(200, { ok: true, counts: {}, reason: "db-unavailable", debug: attempts });
 
     const joinKey = findJoinTableKey(db);
     const leadsKey = findLeadsTableKey(db);
+
     const counts: Record<string, number> = Object.fromEntries(ids.map((id) => [id, 0]));
 
     if (joinKey) {
-      const join = db[joinKey];
-      const rows = (await join.list?.({ limit: 10000 })) ?? [];
+      const rows = (await db[joinKey].list?.({ limit: 10000 })) ?? [];
       for (const r of rows) {
         const cid = getCampaignIdFromRow(r);
         const lid = getLeadIdFromRow(r);
         if (cid && lid && cid in counts) counts[cid] += 1;
       }
-      return send(200, { ok: true, counts, joinKey, leadsKey });
+      return send(200, { ok: true, counts, joinKey, leadsKey, debug: attempts });
     }
 
     if (leadsKey) {
-      const leads = db[leadsKey];
-      const rows = (await leads.list?.({ limit: 10000 })) ?? [];
+      const rows = (await db[leadsKey].list?.({ limit: 10000 })) ?? [];
       for (const r of rows) {
         const cid = getCampaignIdFromRow(r);
         if (cid && cid in counts) counts[cid] += 1;
       }
-      return send(200, { ok: true, counts, joinKey, leadsKey });
+      return send(200, { ok: true, counts, joinKey, leadsKey, debug: attempts });
     }
 
-    return send(200, { ok: true, counts: {}, reason: "no-join-or-leads", joinKey, leadsKey });
+    return send(200, { ok: true, counts: {}, reason: "no-join-or-leads", joinKey, leadsKey, debug: attempts });
   }
 
-  /* ------------------------- ATTACH leads (POST) --------------------- */
-  if (method !== "POST") return send(405, { error: "Method not allowed" });
+  // ATTACH leads
+  if (event.httpMethod !== "POST") return send(405, { error: "Method not allowed" });
 
   const body = (() => {
     try {
@@ -248,22 +238,26 @@ export const handler: Handler = async (event) => {
     }
   })();
 
-  const campaignId = qs.id ?? body?.campaignId ?? null;
+  const campaignId =
+    event.queryStringParameters?.id ??
+    body?.campaignId ??
+    null;
+
   const leadIds: string[] = Array.isArray(body?.leadIds) ? body.leadIds.filter(Boolean) : [];
 
   if (!campaignId) return send(400, { error: "campaignId missing" });
   if (!leadIds.length) return send(400, { error: "leadIds[] required" });
-  if (!db) return send(200, { inserted: 0, skipped: 0, reason: "DB unavailable on server" } as AttachResult);
+
+  if (!db) return send(200, { inserted: 0, skipped: 0, reason: "DB unavailable on server", debug: attempts } as AttachResult);
 
   const dbKeys = Object.keys(db);
   const joinKey = findJoinTableKey(db);
   const leadsKey = findLeadsTableKey(db);
 
-  // Try to ensure the lead rows exist (useful for FK constraints)
+  // Ensure leads exist if we can (for FK constraints)
   if (leadsKey) {
     const me = await blink.auth?.me?.().catch(() => null);
     const leadsTbl: any = db[leadsKey];
-
     for (const lid of new Set(leadIds)) {
       const candidates = [{ id: lid, userId: me?.id }, { id: lid, user_id: me?.id }, { id: lid }];
       for (const c of candidates) {
@@ -283,10 +277,10 @@ export const handler: Handler = async (event) => {
     }
   }
 
-  let inserted = 0;
-  let skipped = 0;
+  let inserted = 0,
+    skipped = 0;
 
-  // 1) Preferred: dedicated join table
+  // Join table path first
   if (joinKey) {
     const join = db[joinKey];
     const campaignFields = ["campaignId", "campaign_id", "campaign", "campaignID", "campaignid", "campaignKey"];
@@ -314,7 +308,6 @@ export const handler: Handler = async (event) => {
             return "ok";
           } catch (e) {
             if (isDup(e)) return "dup";
-            // keep trying other shapes
           }
         }
       }
@@ -339,10 +332,10 @@ export const handler: Handler = async (event) => {
       else if (r === "dup") skipped++;
     }
 
-    return send(200, { inserted, skipped, debug: wantDebug ? { joinKey, leadsKey, dbKeys } : undefined } as AttachResult);
+    return send(200, { inserted, skipped, debug: { joinKey, leadsKey, dbKeys, attempts } } as AttachResult);
   }
 
-  // 2) Fallback: stamp campaignId on lead rows
+  // Fallback: stamp on leads table
   if (leadsKey) {
     const leadsTbl: any = db[leadsKey];
     const candidates = ["campaignId", "campaign_id", "campaign", "campaignKey"];
@@ -376,14 +369,13 @@ export const handler: Handler = async (event) => {
       else if (r === "dup") skipped++;
     }
 
-    return send(200, { inserted, skipped, debug: wantDebug ? { joinKey, leadsKey, dbKeys } : undefined } as AttachResult);
+    return send(200, { inserted, skipped, debug: { joinKey, leadsKey, dbKeys, attempts } } as AttachResult);
   }
 
-  // 3) Nothing matched
   return send(200, {
     inserted: 0,
     skipped: 0,
     reason: "No suitable join/leads table discovered",
-    debug: wantDebug ? { dbKeys } : undefined,
-  } as AttachResult);
+    debug: { dbKeys, attempts },
+  });
 };
