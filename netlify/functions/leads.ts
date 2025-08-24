@@ -9,12 +9,6 @@ const send = (code: number, body: unknown) => ({
   body: JSON.stringify(body),
 });
 
-const get = (obj: any, keys: string[]) => {
-  for (const k of keys) if (obj && k in obj) return obj[k];
-  return undefined;
-};
-
-/* ------------------------- load Blink on server ------------------------ */
 /** Try several require paths; fall back to globalThis.blink. */
 function getBlink(): any {
   let req: any;
@@ -40,7 +34,6 @@ function getBlink(): any {
   return (globalThis as any).blink ?? null;
 }
 
-/* ----------------------- discover the leads table ---------------------- */
 function findLeadsTableKey(db: any): string | null {
   const keys = Object.keys(db || {});
   const preferred = [
@@ -54,12 +47,16 @@ function findLeadsTableKey(db: any): string | null {
     "realLeadDatabase",
     "leadDatabase",
     "realLeads",
+    // add any custom names you use here:
+    "lead_db",
+    "lead_database",
   ];
   for (const k of preferred) {
     const t = db?.[k];
     if (t && (typeof t.list === "function" || typeof t.update === "function" || typeof t.upsert === "function"))
       return k;
   }
+  // heuristic fallback
   return (
     keys.find((k) => {
       if (/campaign/i.test(k)) return false;
@@ -70,9 +67,8 @@ function findLeadsTableKey(db: any): string | null {
   );
 }
 
-/* ------------------------------ normalize ----------------------------- */
-function normLeadRow(r: any) {
-  const id =
+function getId(r: any): string | null {
+  return (
     r?.id ??
     r?.key ??
     r?._id ??
@@ -87,71 +83,65 @@ function normLeadRow(r: any) {
     r?.person_id ??
     r?.recordId ??
     r?.record_id ??
-    null;
-
-  const name =
-    r?.name ??
-    r?.fullName ??
-    r?.full_name ??
-    [r?.firstName ?? r?.first_name, r?.lastName ?? r?.last_name].filter(Boolean).join(" ").trim() ||
-    null;
-
-  const email =
-    r?.email ??
-    r?.workEmail ??
-    r?.work_email ??
-    r?.businessEmail ??
-    r?.business_email ??
-    null;
-
-  return { id, name, email, raw: r };
+    null
+  );
 }
 
-/* -------------------------------- API --------------------------------- */
 export const handler: Handler = async (event) => {
-  // only GET is supported
-  if (event.httpMethod !== "GET") {
-    return send(405, { error: "Method not allowed" });
-  }
-
   const blink = getBlink();
   const db: any = blink?.db;
 
-  // health
-  if (!event.queryStringParameters || Object.keys(event.queryStringParameters).length === 0) {
+  const debug = event.queryStringParameters?.debug ? true : false;
+  const limit = Math.max(1, Math.min(200, Number(event.queryStringParameters?.limit ?? 20)));
+
+  if (!db) {
     return send(200, {
-      ok: true,
-      path: event.path,
-      rawUrl: (event as any).rawUrl ?? null,
-      hasDB: Boolean(db),
+      ok: false,
+      reason: "DB unavailable on server",
+      rows: [],
+      ...(debug ? { tables: [] } : {}),
     });
   }
 
-  if (!db) return send(200, { ok: false, reason: "DB unavailable on server", rows: [] });
-
   const leadsKey = findLeadsTableKey(db);
-  if (!leadsKey) return send(200, { ok: true, rows: [], reason: "no-leads-table" });
-
-  const limit = Math.max(1, Math.min(200, Number(event.queryStringParameters?.limit ?? 20)));
-  const offset = Math.max(0, Number(event.queryStringParameters?.offset ?? 0));
-
-  let rows: any[] = [];
-  try {
-    // Prefer list({ limit, offset }) if available
-    if (typeof db[leadsKey].list === "function") {
-      rows = (await db[leadsKey].list({ limit, offset })) ?? [];
-    } else if (typeof db[leadsKey].all === "function") {
-      rows = await db[leadsKey].all();
-      rows = rows.slice(offset, offset + limit);
-    } else {
-      rows = [];
-    }
-  } catch (e: any) {
-    return send(200, { ok: false, reason: String(e?.message ?? e ?? "unknown"), rows: [] });
+  if (!leadsKey) {
+    return send(200, {
+      ok: true,
+      rows: [],
+      reason: "no-leads-table",
+      ...(debug ? { tables: Object.keys(db || {}) } : {}),
+    });
   }
 
-  const out = (Array.isArray(rows) ? rows : []).map(normLeadRow).filter((x) => x.id);
-  return send(200, { ok: true, table: leadsKey, rows: out });
-};
+  // Try list; if your adapter needs different args, adapt here.
+  let rawRows: any[] = [];
+  try {
+    rawRows = (await db[leadsKey].list?.({ limit })) ?? [];
+  } catch {
+    // silently ignore; return empty
+  }
 
-export default handler;
+  const rows = (Array.isArray(rawRows) ? rawRows : []).map((r) => {
+    const id = getId(r);
+    const email = r?.email ?? r?.workEmail ?? r?.work_email ?? r?.businessEmail ?? r?.business_email ?? null;
+    const name =
+      r?.name ??
+      r?.fullName ??
+      r?.full_name ??
+      r?.firstName && r?.lastName ? `${r.firstName} ${r.lastName}` : null ??
+      r?.company ??
+      email ??
+      "(no name)";
+    return { id, name, email, raw: r };
+  });
+
+  // filter out rows without an ID so the console snippet stays clean
+  const filtered = rows.filter((x) => x.id);
+
+  return send(200, {
+    ok: true,
+    table: leadsKey,
+    rows: filtered,
+    ...(debug ? { tables: Object.keys(db || {}) } : {}),
+  });
+};
