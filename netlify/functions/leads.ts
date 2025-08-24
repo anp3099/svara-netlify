@@ -9,6 +9,11 @@ const send = (code: number, body: unknown) => ({
   body: JSON.stringify(body),
 });
 
+const get = (obj: any, keys: string[]) => {
+  for (const k of keys) if (obj && k in obj) return obj[k];
+  return undefined;
+};
+
 /* ------------------------- load Blink on server ------------------------ */
 /** Try several require paths; fall back to globalThis.blink. */
 function getBlink(): any {
@@ -35,7 +40,7 @@ function getBlink(): any {
   return (globalThis as any).blink ?? null;
 }
 
-/* -------------------------- table discovery --------------------------- */
+/* ----------------------- discover the leads table ---------------------- */
 function findLeadsTableKey(db: any): string | null {
   const keys = Object.keys(db || {});
   const preferred = [
@@ -65,46 +70,88 @@ function findLeadsTableKey(db: any): string | null {
   );
 }
 
-/* ------------------------------ handler ------------------------------- */
+/* ------------------------------ normalize ----------------------------- */
+function normLeadRow(r: any) {
+  const id =
+    r?.id ??
+    r?.key ??
+    r?._id ??
+    r?.uuid ??
+    r?.leadId ??
+    r?.lead_id ??
+    r?.contactId ??
+    r?.contact_id ??
+    r?.prospectId ??
+    r?.prospect_id ??
+    r?.personId ??
+    r?.person_id ??
+    r?.recordId ??
+    r?.record_id ??
+    null;
+
+  const name =
+    r?.name ??
+    r?.fullName ??
+    r?.full_name ??
+    [r?.firstName ?? r?.first_name, r?.lastName ?? r?.last_name].filter(Boolean).join(" ").trim() ||
+    null;
+
+  const email =
+    r?.email ??
+    r?.workEmail ??
+    r?.work_email ??
+    r?.businessEmail ??
+    r?.business_email ??
+    null;
+
+  return { id, name, email, raw: r };
+}
+
+/* -------------------------------- API --------------------------------- */
 export const handler: Handler = async (event) => {
+  // only GET is supported
   if (event.httpMethod !== "GET") {
-    return send(405, { ok: false, error: "Method not allowed" });
+    return send(405, { error: "Method not allowed" });
   }
 
   const blink = getBlink();
   const db: any = blink?.db;
 
-  if (!db) {
-    return send(200, { ok: false, reason: "DB unavailable on server", rows: [] });
+  // health
+  if (!event.queryStringParameters || Object.keys(event.queryStringParameters).length === 0) {
+    return send(200, {
+      ok: true,
+      path: event.path,
+      rawUrl: (event as any).rawUrl ?? null,
+      hasDB: Boolean(db),
+    });
   }
+
+  if (!db) return send(200, { ok: false, reason: "DB unavailable on server", rows: [] });
 
   const leadsKey = findLeadsTableKey(db);
-  if (!leadsKey) {
-    return send(200, { ok: true, reason: "no-leads-table", rows: [] });
+  if (!leadsKey) return send(200, { ok: true, rows: [], reason: "no-leads-table" });
+
+  const limit = Math.max(1, Math.min(200, Number(event.queryStringParameters?.limit ?? 20)));
+  const offset = Math.max(0, Number(event.queryStringParameters?.offset ?? 0));
+
+  let rows: any[] = [];
+  try {
+    // Prefer list({ limit, offset }) if available
+    if (typeof db[leadsKey].list === "function") {
+      rows = (await db[leadsKey].list({ limit, offset })) ?? [];
+    } else if (typeof db[leadsKey].all === "function") {
+      rows = await db[leadsKey].all();
+      rows = rows.slice(offset, offset + limit);
+    } else {
+      rows = [];
+    }
+  } catch (e: any) {
+    return send(200, { ok: false, reason: String(e?.message ?? e ?? "unknown"), rows: [] });
   }
 
-  const limit = Math.max(
-    1,
-    Math.min( Number(event.queryStringParameters?.limit ?? 20) || 20, 200)
-  );
-
-  // Pull some leads
-  const rawRows =
-    (await db[leadsKey].list?.({ limit })) ??
-    [];
-
-  // Normalize a few common fields so the UI/snippets are predictable
-  const rows = rawRows.map((r: any) => ({
-    id: r?.id ?? r?.key ?? r?._id ?? r?.uuid ?? r?.email ?? null,
-    name: r?.name ?? r?.fullName ?? r?.full_name ?? r?.company ?? r?.email ?? "(no name)",
-    email:
-      r?.email ??
-      r?.workEmail ?? r?.work_email ??
-      r?.businessEmail ?? r?.business_email ??
-      r?.personalEmail ?? r?.personal_email ??
-      r?.contact_email ?? null,
-    raw: r,
-  }));
-
-  return send(200, { ok: true, table: leadsKey, rows });
+  const out = (Array.isArray(rows) ? rows : []).map(normLeadRow).filter((x) => x.id);
+  return send(200, { ok: true, table: leadsKey, rows: out });
 };
+
+export default handler;
