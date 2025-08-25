@@ -2,321 +2,209 @@
 import type { Handler } from "@netlify/functions";
 import { getBlink } from "./_blink";
 
-/* Load .env locally; harmless on Netlify where env vars are injected */
-try {
-  (eval as any)("require")("dotenv").config();
-} catch {}
+const JSON_HEADERS = { "Content-Type": "application/json" };
+const send = (code: number, body: unknown) => ({
+  statusCode: code,
+  headers: JSON_HEADERS,
+  body: JSON.stringify(body),
+});
 
-/* ------------------------------- CSV utils ------------------------------- */
-/** Simple CSV parser: handles quotes, commas, and newlines. */
-function parseCSV(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cur = "";
-  let i = 0;
-  const n = text.length;
-  let inQuotes = false;
+type RawRow = Record<string, any>;
+type NormLead = {
+  id: string | null;
+  company?: string | null;
+  name?: string | null;
+  email?: string | null;
+  industry?: string | null;
+  size?: string | number | null;
+  revenue?: string | number | null;
+  location?: string | null;
+  score?: number | null;
+  raw?: any;
+};
 
-  const pushCell = () => {
-    row.push(cur);
-    cur = "";
-  };
-  const pushRow = () => {
-    // ignore trailing empty line
-    if (!(row.length === 1 && row[0] === "")) rows.push(row);
-    row = [];
-  };
-
-  while (i < n) {
-    const ch = text[i];
-
-    if (inQuotes) {
-      if (ch === '"') {
-        const next = text[i + 1];
-        if (next === '"') {
-          cur += '"'; // escaped quote
-          i += 2;
-        } else {
-          inQuotes = false;
-          i++;
-        }
-      } else {
-        cur += ch;
-        i++;
-      }
-      continue;
-    }
-
-    if (ch === '"') {
-      inQuotes = true;
-      i++;
-      continue;
-    }
-    if (ch === ",") {
-      pushCell();
-      i++;
-      continue;
-    }
-    if (ch === "\r") {
-      i++;
-      continue; // normalize CRLF
-    }
-    if (ch === "\n") {
-      pushCell();
-      pushRow();
-      i++;
-      continue;
-    }
-    cur += ch;
-    i++;
-  }
-  // last cell/row
-  pushCell();
-  pushRow();
-  return rows;
-}
-
-/** Turn CSV into objects using header row. */
-function csvToObjects(csv: string): Record<string, string>[] {
-  const rows = parseCSV(csv);
-  if (!rows.length) return [];
-  const headers = rows[0].map((h) => (h || "").trim());
-  const out: Record<string, string>[] = [];
-  for (let r = 1; r < rows.length; r++) {
-    const o: Record<string, string> = {};
-    const cells = rows[r];
-    headers.forEach((h, c) => (o[h] = (cells[c] ?? "").trim()));
-    out.push(o);
-  }
+function chunk<T>(arr: T[], size = 50): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
 
-/* ------------------------ DB discovery / normalization ------------------- */
+/** tiny id helper */
+function rid(prefix = "lead_") {
+  return prefix + Math.random().toString(36).slice(2, 10);
+}
+
+/** CSV parser that handles commas-in-quotes and double quotes */
+function parseCsv(text: string): RawRow[] {
+  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter(Boolean);
+  if (!lines.length) return [];
+
+  const split = (line: string) => {
+    const out: string[] = [];
+    let cur = "";
+    let q = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (q && line[i + 1] === '"') { cur += '"'; i++; } else { q = !q; }
+      } else if (ch === "," && !q) {
+        out.push(cur);
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    out.push(cur);
+    return out.map(s => s.trim());
+  };
+
+  const header = split(lines[0]).map(h => h.toLowerCase());
+  const rows: RawRow[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = split(lines[i]);
+    if (cols.length === 1 && cols[0] === "") continue;
+    const obj: RawRow = {};
+    header.forEach((h, idx) => (obj[h] = cols[idx] ?? null));
+    rows.push(obj);
+  }
+  return rows;
+}
+
+/** Find the leads table key on Blink DB (same style as your other functions) */
 function findLeadsTableKey(db: any): string | null {
   const keys = Object.keys(db || {});
   const preferred = [
-    "leads",
-    "lead",
-    "contacts",
-    "prospects",
-    "people",
-    "persons",
-    "records",
-    "realLeadDatabase",
-    "leadDatabase",
-    "realLeads",
+    "leads","lead","contacts","prospects","people","persons","records",
+    "realLeadDatabase","leadDatabase","realLeads",
   ];
   for (const k of preferred) {
     const t = db?.[k];
-    if (t && (typeof t.upsert === "function" || typeof t.create === "function")) return k;
+    if (t && (typeof t.list === "function" || typeof t.update === "function" || typeof t.upsert === "function"))
+      return k;
   }
   return (
-    keys.find(
-      (k) =>
-        /lead|contact|prospect|people|person|record/i.test(k) &&
-        (typeof db?.[k]?.upsert === "function" || typeof db?.[k]?.create === "function"),
-    ) ?? null
+    keys.find(k => {
+      if (/campaign/i.test(k)) return false;
+      if (!/lead|contact|prospect|people|person|record/i.test(k)) return false;
+      const t = db?.[k];
+      return typeof t?.list === "function" || typeof t?.update === "function" || typeof t?.upsert === "function";
+    }) ?? null
   );
 }
 
-/** make a safe id: prefer email; else compact "company:name"; else a random id */
-function makeId(row: Record<string, string>): string {
-  const email =
-    row.email || row.Email || row.contactEmail || row["Contact Email"] || row["contact email"];
-  if (email) return email.toLowerCase();
+function normOne(r: RawRow): NormLead {
+  // accept many header synonyms
+  const get = (...names: string[]) => {
+    for (const n of names) {
+      const v = r[n] ?? r[n.toLowerCase()];
+      if (v !== undefined) return v;
+    }
+    return null;
+  };
 
-  const company =
-    row.company ||
-    row.Company ||
-    row.companyName ||
-    row["Company Name"] ||
-    row.org ||
-    row.business ||
-    "";
+  const email = (get("email","contactEmail","workEmail","businessEmail") || null)?.toString() || null;
+  const id =
+    (get("id") as string) ||
+    (email as string) ||
+    null;
+
   const name =
-    row.name ||
-    row.Name ||
-    row.contact ||
-    row.Contact ||
-    [row.firstName || row["First Name"] || "", row.lastName || row["Last Name"] || ""]
-      .filter(Boolean)
-      .join(" ");
+    (get("name","fullName","full_name","contact","contactName") as string) ||
+    (([get("firstName","firstname"), get("lastName","lastname")].filter(Boolean) as string[]).join(" ") || null);
 
-  const base = [company, name].filter(Boolean).join(":").toLowerCase();
-  if (base) {
-    return base
-      .replace(/\s+/g, "-")
-      .replace(/[^a-z0-9:@._-]+/g, "")
-      .slice(0, 120);
-  }
-  return `lead_${Math.random().toString(36).slice(2, 10)}`;
+  return {
+    id,
+    company: (get("company","companyName","org","business") as string) || null,
+    name: name || null,
+    email,
+    industry: (get("industry","vertical") as string) || null,
+    size: (get("size","companySize","employees") as any) ?? null,
+    revenue: (get("revenue","annualRevenue") as any) ?? null,
+    location: (get("location","city","region","state","country") as string) || null,
+    score: Number(get("score","fit") as any) || null,
+    raw: r,
+  };
 }
 
-/** map your CSV columns to a normalized lead object */
-function normalize(row: Record<string, string>) {
-  const id = makeId(row);
-  const company =
-    row.company ||
-    row.Company ||
-    row.companyName ||
-    row["Company Name"] ||
-    row.org ||
-    row.business ||
-    null;
-
-  // Prefer one combined name when present, else stitch first/last
-  const nameRaw =
-    row.name || row.Name || row.contact || row.Contact || row.person || row["Full Name"] || "";
-  const first = row.firstName || row["First Name"] || "";
-  const last = row.lastName || row["Last Name"] || "";
-  const name = nameRaw || [first, last].filter(Boolean).join(" ") || null;
-
-  const email =
-    row.email ||
-    row.Email ||
-    row.contactEmail ||
-    row["Contact Email"] ||
-    row.workEmail ||
-    row.businessEmail ||
-    row.work_email ||
-    row.business_email ||
-    null;
-
-  const industry = row.industry || row.Industry || row.vertical || null;
-  const size = row.size || row["Company Size"] || row.employees || row.employeeCount || null;
-  const revenue = row.revenue || row["Annual Revenue"] || null;
-  const location =
-    row.location ||
-    row.city ||
-    row.City ||
-    row.region ||
-    row.Region ||
-    row.state ||
-    row.State ||
-    row.country ||
-    row.Country ||
-    null;
-
-  // Number-ish score
-  const scoreStr = row.score || row.Score || "";
-  const score = Number.isFinite(+scoreStr) ? +scoreStr : 0;
-
-  return { id, company, name, email, industry, size, revenue, location, score };
-}
-
-/* -------------------------------- handler -------------------------------- */
 export const handler: Handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return {
-      statusCode: 405,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Method not allowed" }),
-    };
+  if (event.httpMethod === "GET") {
+    // quick diagnostics / docs
+    return send(200, { ok: true, usage: "POST CSV (text/csv) or JSON { rows:[...] } to /api/leads-import" });
   }
+  if (event.httpMethod !== "POST") return send(405, { error: "Method not allowed" });
+
+  const blink = await getBlink();
+  const db: any = blink?.db;
+  if (!db) return send(200, { ok: false, reason: "db-unavailable" });
+
+  const leadsKey = findLeadsTableKey(db);
+  if (!leadsKey) return send(200, { ok: false, reason: "no-leads-table" });
+
+  const ctype = String(event.headers["content-type"] || event.headers["Content-Type"] || "").toLowerCase();
+  let rows: RawRow[] = [];
 
   try {
-    const blink = await getBlink();
-    const db: any = (blink as any)?.db;
-    if (!db) {
-      return {
-        statusCode: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ok: false, reason: "db-unavailable" }),
-      };
+    if (ctype.includes("application/json")) {
+      const body = JSON.parse(event.body || "{}");
+      rows = Array.isArray(body?.rows) ? body.rows : [];
+    } else {
+      // treat everything else as CSV (text/csv, text/plain)
+      const text = event.body || "";
+      rows = parseCsv(text);
     }
-
-    const leadsKey = findLeadsTableKey(db);
-    if (!leadsKey) {
-      return {
-        statusCode: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ok: false, reason: "no-leads-table" }),
-      };
-    }
-    const leadsTbl: any = db[leadsKey];
-
-    // Decode CSV body (Netlify may base64-encode)
-    const csv = event.isBase64Encoded
-      ? Buffer.from(event.body || "", "base64").toString("utf8")
-      : (event.body || "");
-
-    const rows = csvToObjects(csv);
-    const dry = String(event.queryStringParameters?.dry ?? "").toLowerCase() === "1";
-
-    let inserted = 0;
-    let updated = 0;
-    let skipped = 0;
-    const errors: Array<{ id: string; error: string }> = [];
-
-    for (const r of rows) {
-      const doc = normalize(r);
-
-      if (dry) {
-        // just count what would be done
-        if (doc.id) inserted++;
-        continue;
-      }
-
-      try {
-        if (typeof leadsTbl.upsert === "function") {
-          await leadsTbl.upsert({
-            where: { id: doc.id },
-            update: {
-              company: doc.company,
-              name: doc.name,
-              email: doc.email,
-              industry: doc.industry,
-              size: doc.size,
-              revenue: doc.revenue,
-              location: doc.location,
-              score: doc.score,
-            },
-            create: doc,
-          });
-          // we don't know if it was insert or update; do a lightweight guess:
-          // If you want precise counts, you could query first; keeping simple here.
-          inserted++;
-        } else if (typeof leadsTbl.create === "function") {
-          await leadsTbl.create(doc);
-          inserted++;
-        } else {
-          skipped++;
-        }
-      } catch (e: any) {
-        const msg = String(e?.message ?? e ?? "unknown");
-        // Treat duplicates as "updated/skipped", not hard errors
-        if (/duplicate|unique|already exists|conflict/i.test(msg)) {
-          updated++;
-        } else {
-          skipped++;
-          errors.push({ id: doc.id, error: msg });
-        }
-      }
-    }
-
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ok: true,
-        table: leadsKey,
-        total: rows.length,
-        inserted,
-        updated,
-        skipped,
-        errors,
-      }),
-    };
   } catch (e: any) {
-    return {
-      statusCode: 500,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ok: false,
-        errorType: e?.name || "Error",
-        errorMessage: e?.message || String(e),
-        trace: (e?.stack || "").split("\n").slice(0, 6),
-      }),
-    };
+    return send(400, { ok: false, reason: "parse-failed", message: String(e?.message || e) });
   }
+
+  // normalize
+  const normalized = rows.map(normOne).map(r => ({ ...r, id: r.id || rid() }));
+
+  const tbl: any = db[leadsKey];
+  let inserted = 0, skipped = 0, failed = 0;
+  const errors: { id: string; message: string }[] = [];
+
+  // Process in small batches to avoid timeouts
+  for (const group of chunk(normalized, 25)) {
+    const results = await Promise.allSettled(
+      group.map(async (rec) => {
+        const patch: any = {
+          company: rec.company ?? undefined,
+          name: rec.name ?? undefined,
+          email: rec.email ?? undefined,
+          industry: rec.industry ?? undefined,
+          size: rec.size ?? undefined,
+          revenue: rec.revenue ?? undefined,
+          location: rec.location ?? undefined,
+          score: rec.score ?? undefined,
+        };
+
+        // prefer upsert; fallback to create/patch patterns
+        if (typeof tbl.upsert === "function") {
+          await tbl.upsert({ where: { id: rec.id }, update: patch, create: { id: rec.id, ...patch } });
+        } else if (typeof tbl.update === "function") {
+          try {
+            await tbl.update(rec.id, patch);
+          } catch {
+            if (typeof tbl.create === "function") await tbl.create({ id: rec.id, ...patch });
+            else throw new Error("No upsert/update/create available");
+          }
+        } else if (typeof tbl.create === "function") {
+          await tbl.create({ id: rec.id, ...patch });
+        } else {
+          throw new Error("No write method on leads table");
+        }
+      })
+    );
+
+    for (const [i, res] of results.entries()) {
+      const id = group[i].id || "(unknown)";
+      if (res.status === "fulfilled") inserted++;
+      else {
+        failed++;
+        errors.push({ id, message: String((res as any).reason?.message || res) });
+      }
+    }
+  }
+
+  return send(200, { ok: true, table: leadsKey, inserted, failed, skipped, total: normalized.length, errors });
 };
