@@ -1,8 +1,7 @@
 // netlify/functions/leads.ts
 import type { Handler } from "@netlify/functions";
-import { getBlink } from "./_blink";
+import { getBlink, blinkDebug } from "./_blink";
 
-/* ----------------------------- utils ----------------------------- */
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const send = (code: number, body: unknown) => ({
   statusCode: code,
@@ -10,241 +9,184 @@ const send = (code: number, body: unknown) => ({
   body: JSON.stringify(body),
 });
 
-const isDup = (e: any) =>
-  /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
+/* --------------------------- normalization --------------------------- */
 
-/** Try to find a “Leads” store (KV or table) in blink.db */
-function findLeadsStore(db: any): any | null {
-  if (!db) return null;
+type AnyRow = Record<string, any>;
+const pick = (...vals: any[]) => vals.find(v => v !== undefined && v !== null) ?? null;
 
-  // common, case-insensitive names
-  const candidates = [
-    "Leads",
-    "leads",
-    "LeadDatabase",
-    "leadDatabase",
-    "records",
-    "contacts",
-    "prospects",
-  ];
-
-  for (const k of Object.keys(db)) {
-    if (candidates.includes(k) || /lead/i.test(k)) {
-      const t = db[k];
-      if (t && (typeof t.list === "function" || typeof t.put === "function" || typeof t.upsert === "function")) {
-        return t;
-      }
-    }
-  }
-  return null;
-}
-
-type KvItem = { key: string; value: any };
-type RelItem = any;
-
-/** Normalize 1 item (KV or relational) into the UI-friendly shape */
-function normalizeOne(x: any) {
-  // KV style: { key, value }
-  if (x && typeof x === "object" && "key" in x) {
-    const v = (x as KvItem).value ?? {};
-    return {
-      id: (x as KvItem).key ?? v.id ?? null,
-      company: v.company ?? v.companyName ?? v.org ?? null,
-      name: v.name ?? v.fullName ?? null,
-      email: v.email ?? v.contactEmail ?? v.workEmail ?? v.businessEmail ?? null,
-      industry: v.industry ?? null,
-      raw: x,
-    };
-  }
-  // Relational style: row with columns
-  const r = x as RelItem;
+function normalizeFromDb(r: AnyRow) {
   return {
-    id: r?.id ?? r?.key ?? r?._id ?? r?.uuid ?? null,
-    company: r?.company ?? r?.companyName ?? r?.org ?? null,
-    name: r?.name ?? r?.fullName ?? r?.full_name ?? null,
-    email: r?.email ?? r?.contactEmail ?? r?.workEmail ?? r?.businessEmail ?? null,
-    industry: r?.industry ?? null,
-    raw: r,
+    id:        pick(r?.id, r?.key, r?._id, r?.uuid, r?.email),
+    company:   pick(r?.company, r?.companyName, r?.org, r?.business),
+    name:      pick(r?.name, r?.fullName, r?.full_name, r?.contact, r?.person),
+    email:     pick(r?.email, r?.contactEmail, r?.workEmail, r?.businessEmail, r?.work_email, r?.business_email),
+    industry:  pick(r?.industry, r?.vertical),
+    size:      pick(r?.size, r?.companySize, r?.employees),
+    revenue:   pick(r?.revenue, r?.annualRevenue),
+    location:  pick(r?.location, r?.city, r?.region, r?.state),
+    score:     pick(r?.score, r?.fit, 0),
+    raw:       r,
   };
 }
 
-function parseCsv(text: string): Array<Record<string, string>> {
-  // minimalist CSV parser: header row + commas, supports quoted fields
-  const rows: string[] = [];
-  let cur = "", inQ = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === "\"") {
-      if (inQ && text[i + 1] === "\"") { cur += "\""; i++; } else { inQ = !inQ; }
-    } else if (c === "\n" && !inQ) {
-      rows.push(cur.replace(/\r$/, "")); cur = "";
-    } else {
-      cur += c;
-    }
-  }
-  if (cur) rows.push(cur.replace(/\r$/, ""));
-
-  if (!rows.length) return [];
-  const headers = rows[0].split(",").map(h => h.trim());
-  const out: Array<Record<string, string>> = [];
-  for (let i = 1; i < rows.length; i++) {
-    if (!rows[i]) continue;
-    const cols: string[] = [];
-    // split row by commas respecting quotes (simple again)
-    let cell = "", q = false;
-    const s = rows[i];
-    for (let j = 0; j < s.length; j++) {
-      const ch = s[j];
-      if (ch === "\"") {
-        if (q && s[j + 1] === "\"") { cell += "\""; j++; }
-        else { q = !q; }
-      } else if (ch === "," && !q) {
-        cols.push(cell); cell = "";
-      } else {
-        cell += ch;
-      }
-    }
-    cols.push(cell);
-
-    const rec: Record<string, string> = {};
-    headers.forEach((h, idx) => (rec[h] = (cols[idx] ?? "").trim()));
-    out.push(rec);
-  }
-  return out;
+function normalizeFromKv(item: { key: string; value: AnyRow }) {
+  const v = item?.value ?? {};
+  return {
+    id:        pick(v?.id, item?.key, v?.email),
+    company:   pick(v?.company, v?.companyName, v?.org, v?.business),
+    name:      pick(v?.name, v?.fullName, v?.full_name, v?.contact, v?.person),
+    email:     pick(v?.email, v?.contactEmail, v?.workEmail, v?.businessEmail),
+    industry:  pick(v?.industry, v?.vertical),
+    size:      pick(v?.size, v?.companySize, v?.employees),
+    revenue:   pick(v?.revenue, v?.annualRevenue),
+    location:  pick(v?.location, v?.city, v?.region, v?.state),
+    score:     pick(v?.score, v?.fit, 0),
+    raw:       item,
+  };
 }
 
-function pick<T = any>(obj: any, names: string[]): T | null {
-  for (const n of names) {
-    if (obj?.[n]) return obj[n] as T;
+/* ----------------------------- helpers ------------------------------ */
+
+function findLeadsTableKey(db: any): string | null {
+  const keys = Object.keys(db || {});
+  const preferred = ["leads","lead","contacts","prospects","people","persons","records","leadDatabase","realLeads","realLeadDatabase"];
+  for (const k of preferred) {
+    const t = db?.[k];
+    if (t && typeof t.list === "function") return k;
   }
-  return null;
+  return keys.find(k => /lead|contact|prospect|people|person|record/i.test(k) && typeof db?.[k]?.list === "function") ?? null;
 }
 
-/* ------------------------------ handler ------------------------------ */
+async function kvHandle(blink: any) {
+  // try several shapes of KV
+  const b = blink ?? {};
+  const kv =
+    b.kv?.store?.("Leads") ??
+    b.kv?.stores?.Leads ??
+    (typeof b.kv === "function" ? b.kv("Leads") : null) ??
+    b.kv?.Leads ??
+    null;
+  return kv;
+}
+
+/* -------------------------------- API -------------------------------- */
+
 export const handler: Handler = async (event) => {
-  const blink = await getBlink();
-  const db = (blink as any)?.db;
-
-  // quick debug
+  // quick diagnostics
   if (event.httpMethod === "GET" && event.queryStringParameters?.debug) {
-    return send(200, {
-      ok: true,
-      matchedFn: "leads",
-      hasDb: Boolean(db),
-      keys: db ? Object.keys(db) : [],
-    });
+    const diag = await blinkDebug();
+    return send(200, { ok: true, matchedFn: "leads", ...diag });
   }
 
-  // list a few (works if KV or relational)
+  // load blink (DB / KV provider)
+  const blink = await getBlink();
+
+  /* -------- GET: list leads (normalized, for your UI) -------- */
   if (event.httpMethod === "GET") {
-    const store = findLeadsStore(db);
-    if (!store) return send(200, { ok: true, items: [], store: null, reason: "no-store" });
+    const limit = Math.min(parseInt(event.queryStringParameters?.limit || "50", 10) || 50, 500);
 
-    const limit = Math.min(parseInt(event.queryStringParameters?.limit || "50", 10) || 50, 200);
-    const items =
-      typeof store.list === "function"
-        ? await store.list({ limit }).catch(() => [])
-        : [];
+    // 1) DB path
+    const db: any = (blink as any)?.db;
+    const key = db ? findLeadsTableKey(db) : null;
+    if (db && key) {
+      const list = (await db[key].list?.({ limit })) ?? [];
+      const rows = list.map(normalizeFromDb);
+      return send(200, { ok: true, rows, source: "db", table: key });
+    }
 
-    const rows = Array.isArray(items) ? items.map(normalizeOne) : [];
-    return send(200, { ok: true, items: rows, store: store?.name ?? "Leads" });
+    // 2) KV path (what you currently have)
+    const kv = await kvHandle(blink);
+    if (kv?.list) {
+      // many KV libs support `{ limit }`; safe default if not
+      const out = await kv.list({ limit }).catch(() => null);
+      const items: Array<{ key: string; value: AnyRow }> =
+        out?.items ?? out?.rows ?? out ?? [];
+      const rows = items.map(normalizeFromKv);
+      return send(200, { ok: true, rows, source: "kv", store: "Leads", count: rows.length });
+    }
+
+    // 3) nothing found
+    return send(200, { ok: true, rows: [], source: "none" });
   }
 
-  // imports / batch puts
+  /* -------- POST: upsert rows into KV (safe even w/out DB) -------- */
   if (event.httpMethod === "POST") {
-    const store = findLeadsStore(db);
-    if (!store) return send(200, { ok: false, reason: "no-store" });
+    // Accept either JSON body { rows: [...] } or CSV text/csv (optional)
+    const contentType = event.headers["content-type"] || event.headers["Content-Type"] || "";
+    let rowsIn: AnyRow[] = [];
 
-    // KV store should expose .put(key, value)
-    const isKv = typeof store.put === "function";
-
-    // 1) CSV?
-    const ct = event.headers["content-type"] || event.headers["Content-Type"] || "";
-    let records: Array<{ id: string; value: any }> = [];
-
-    if (/text\/csv/i.test(ct)) {
-      const csv = event.body ?? "";
-      const rows = parseCsv(csv);
-
-      // try to detect common header names
-      for (const r of rows) {
-        const id =
-          r.id ||
-          pick<string>(r, ["key", "email", "contactEmail", "workEmail", "businessEmail"]) ||
-          "";
-
-        const value = {
-          company: r.company || r.companyName || r.org || null,
-          name:
-            r.name ||
-            r.fullName ||
-            [r.firstName, r.lastName].filter(Boolean).join(" ").trim() ||
-            null,
-          email: r.email || r.contactEmail || r.workEmail || r.businessEmail || null,
-          industry: r.industry || r.vertical || null,
-        };
-
-        const key = id || value.email || "";
-        if (!key) continue;
-        records.push({ id: key, value });
-      }
-    } else {
-      // 2) JSON { records: [{id, value}], id, value }
+    if (/json/i.test(contentType)) {
       try {
         const body = JSON.parse(event.body || "{}");
-        if (Array.isArray(body?.records)) {
-          records = body.records.filter((x: any) => x?.id && x?.value);
-        } else if (body?.id && body?.value) {
-          records = [{ id: body.id, value: body.value }];
-        }
+        rowsIn = Array.isArray(body?.rows) ? body.rows : [];
       } catch {
-        // invalid JSON
+        rowsIn = [];
       }
+    } else if (/text\/csv/i.test(contentType)) {
+      // tiny CSV parser for: email,company,name,industry,location,size,revenue
+      const text = event.body || "";
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      const header = lines.shift()?.split(",").map(s => s.trim()) ?? [];
+      rowsIn = lines.map(line => {
+        const cells = line.split(",").map(s => s.trim());
+        const obj: AnyRow = {};
+        header.forEach((h, i) => (obj[h] = cells[i]));
+        return obj;
+      });
     }
 
-    if (!records.length) {
-      return send(200, { ok: true, inserted: 0, failed: 0, skipped: 0, reason: "no-records" });
+    if (!rowsIn.length) return send(400, { ok: false, error: "no-rows" });
+
+    const kv = await kvHandle(blink);
+    if (!kv?.put && !kv?.set && !kv?.upsert) {
+      return send(501, { ok: false, error: "kv-unavailable" });
     }
 
-    let inserted = 0,
-      failed = 0,
-      skipped = 0;
-    const errors: Array<{ id: string; message: string }> = [];
+    let inserted = 0, skipped = 0, failed = 0;
 
-    // write sequentially (safe for rate limiting)
-    for (const rec of records) {
+    // simple key rule: prefer email, otherwise id, otherwise random
+    for (const r of rowsIn) {
+      const v = r || {};
+      const key: string =
+        (v.email || v.contactEmail || v.workEmail || v.businessEmail || v.id || v.key || "")
+          .toString()
+          .toLowerCase()
+          .trim() || `lead_${Math.random().toString(36).slice(2,9)}`;
+
+      // minimal stored value
+      const value = {
+        id: key,
+        email: v.email ?? v.contactEmail ?? null,
+        company: v.company ?? v.companyName ?? v.org ?? null,
+        name: v.name ?? v.fullName ?? null,
+        industry: v.industry ?? null,
+        size: v.size ?? v.employees ?? null,
+        revenue: v.revenue ?? null,
+        location: v.location ?? v.city ?? v.state ?? v.region ?? null,
+        ...(v.raw ? { raw: v.raw } : {}),
+      };
+
       try {
-        if (isKv) {
-          await store.put(rec.id, rec.value);
-          inserted++;
-        } else if (typeof store.upsert === "function") {
-          await store.upsert({ where: { id: rec.id }, update: rec.value, create: { id: rec.id, ...rec.value } });
-          inserted++;
-        } else if (typeof store.create === "function") {
-          await store.create({ id: rec.id, ...rec.value });
-          inserted++;
+        if (typeof kv.upsert === "function") {
+          await kv.upsert(key, value);
+        } else if (typeof kv.put === "function") {
+          await kv.put(key, value);
+        } else if (typeof kv.set === "function") {
+          await kv.set(key, value);
         } else {
-          failed++;
-          errors.push({ id: rec.id, message: "Store is neither KV (.put) nor relational (create/upsert) capable." });
+          throw new Error("no kv write method");
         }
+        inserted++;
       } catch (e: any) {
-        if (isDup(e)) skipped++;
-        else {
-          failed++;
-          errors.push({ id: rec.id, message: String(e?.message ?? e) });
-        }
+        // treat duplicate-ish messages as skipped
+        const msg = String(e?.message ?? e ?? "");
+        if (/duplicate|exists|conflict|unique/i.test(msg)) skipped++;
+        else failed++;
       }
     }
 
-    return send(200, {
-      ok: true,
-      store: "Leads",
-      inserted,
-      skipped,
-      failed,
-      sampleErrors: errors.slice(0, 5),
-    });
+    return send(200, { ok: true, inserted, skipped, failed, store: "Leads" });
   }
 
-  return send(405, { error: "Method not allowed" });
+  return send(405, { ok: false, error: "method-not-allowed" });
 };
