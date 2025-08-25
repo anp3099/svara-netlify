@@ -2,6 +2,7 @@
 import type { Handler } from "@netlify/functions";
 import { getBlink } from "./_blink";
 
+// ---------- small helpers ----------
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const send = (code: number, body: unknown) => ({
   statusCode: code,
@@ -9,202 +10,224 @@ const send = (code: number, body: unknown) => ({
   body: JSON.stringify(body),
 });
 
-type RawRow = Record<string, any>;
-type NormLead = {
-  id: string | null;
-  company?: string | null;
-  name?: string | null;
-  email?: string | null;
-  industry?: string | null;
-  size?: string | number | null;
-  revenue?: string | number | null;
-  location?: string | null;
-  score?: number | null;
-  raw?: any;
-};
+const isDup = (e: any) =>
+  /duplicate|unique|constraint|already exists/i.test(String(e?.message ?? e ?? ""));
 
-function chunk<T>(arr: T[], size = 50): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+const toArray = <T>(x: T | T[] | null | undefined): T[] =>
+  Array.isArray(x) ? x : x ? [x] : [];
+
+// Parse minimal CSV (quoted fields supported)
+function parseCsv(text: string): Array<Record<string, string>> {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cur = "";
+  let inQ = false;
+
+  const pushCell = () => { row.push(cur); cur = ""; };
+  const pushRow  = () => { rows.push(row); row = []; };
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQ) {
+      if (ch === '"' && text[i + 1] === '"') { cur += '"'; i++; continue; }
+      if (ch === '"') { inQ = false; continue; }
+      cur += ch;
+      continue;
+    }
+    if (ch === '"') { inQ = true; continue; }
+    if (ch === ",") { pushCell(); continue; }
+    if (ch === "\n") { pushCell(); pushRow(); continue; }
+    if (ch === "\r") continue;
+    cur += ch;
+  }
+  // flush
+  pushCell(); if (row.length) pushRow();
+
+  if (!rows.length) return [];
+  const header = rows[0].map(h => (h || "").trim());
+  const out: Record<string, string>[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || r.every(c => !c || !String(c).trim())) continue;
+    const obj: Record<string, string> = {};
+    for (let j = 0; j < header.length; j++) obj[header[j]] = (r[j] ?? "").trim();
+    out.push(obj);
+  }
   return out;
 }
 
-/** tiny id helper */
-function rid(prefix = "lead_") {
-  return prefix + Math.random().toString(36).slice(2, 10);
-}
-
-/** CSV parser that handles commas-in-quotes and double quotes */
-function parseCsv(text: string): RawRow[] {
-  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter(Boolean);
-  if (!lines.length) return [];
-
-  const split = (line: string) => {
-    const out: string[] = [];
-    let cur = "";
-    let q = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (q && line[i + 1] === '"') { cur += '"'; i++; } else { q = !q; }
-      } else if (ch === "," && !q) {
-        out.push(cur);
-        cur = "";
-      } else {
-        cur += ch;
-      }
-    }
-    out.push(cur);
-    return out.map(s => s.trim());
+// Normalize one CSV row to a common shape
+function normalizeRow(r: Record<string, string>) {
+  // possible column names we’ll accept
+  const pick = (row: any, names: string[], fallback: any = null) => {
+    for (const n of names) if (row?.[n]) return row[n];
+    return fallback;
   };
 
-  const header = split(lines[0]).map(h => h.toLowerCase());
-  const rows: RawRow[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = split(lines[i]);
-    if (cols.length === 1 && cols[0] === "") continue;
-    const obj: RawRow = {};
-    header.forEach((h, idx) => (obj[h] = cols[idx] ?? null));
-    rows.push(obj);
-  }
-  return rows;
+  const email   = pick(r, ["email", "contactEmail", "workEmail", "businessEmail"]);
+  const id      = pick(r, ["id", "key", "leadId"]) || (email ? `cb:${email}` : null);
+  const company = pick(r, ["company", "companyName", "org", "business"]);
+  const name    =
+    pick(r, ["name", "fullName", "full_name", "contactName", "person"]) ||
+    ((r["firstName"] || r["lastName"])
+      ? [r["firstName"], r["lastName"]].filter(Boolean).join(" ")
+      : null);
+  const industry = pick(r, ["industry", "vertical"]);
+  const size     = pick(r, ["size", "companySize", "employees"]);
+  const revenue  = pick(r, ["revenue", "annualRevenue"]);
+  const location = pick(r, ["location", "city", "region", "state"]);
+  const score    = pick(r, ["score", "fit"], 0);
+
+  // value object (for KV) or columns (for relational)
+  const value = {
+    company, name, email, industry, size, revenue, location, score,
+    // original row in case you want it later
+    _raw: r,
+  };
+
+  return { id, key: id, value };
 }
 
-/** Find the leads table key on Blink DB (same style as your other functions) */
-function findLeadsTableKey(db: any): string | null {
-  const keys = Object.keys(db || {});
+// Try a variety of write methods depending on store capabilities
+async function writeKV(t: any, key: string, value: any): Promise<"ok" | "dup" | "fail"> {
+  const candidates: Array<() => Promise<any>> = toArray([
+    t?.put && (() => t.put(key, value)),
+    t?.set && (() => t.set(key, value)),
+    t?.upsert && (() => t.upsert({ key, value })),
+    t?.create && (() => t.create({ key, value })),
+    t?.insert && (() => t.insert({ key, value })),
+    // generic 2-arg signatures:
+    t?.upsert && (() => t.upsert(key, value)),
+    t?.create && (() => t.create(key, value)),
+  ]).filter(Boolean);
+
+  for (const fn of candidates) {
+    try { await fn!(); return "ok"; } catch (e) { if (isDup(e)) return "dup"; }
+  }
+  return "fail";
+}
+
+async function writeRelational(t: any, id: string, value: any): Promise<"ok"|"dup"|"fail"> {
+  const row = { id, ...value };
+  try {
+    if (typeof t?.upsert === "function") {
+      await t.upsert({ where: { id }, update: value, create: row });
+      return "ok";
+    }
+  } catch (e) { if (isDup(e)) return "dup"; }
+  try {
+    if (typeof t?.create === "function") {
+      await t.create(row);
+      return "ok";
+    }
+  } catch (e) { if (isDup(e)) return "dup"; }
+  return "fail";
+}
+
+function findLeadsKey(db: any): string | null {
+  const names = Object.keys(db || {});
   const preferred = [
-    "leads","lead","contacts","prospects","people","persons","records",
-    "realLeadDatabase","leadDatabase","realLeads",
+    "Leads","leads","lead","contacts","prospects","people","records",
+    "leadDatabase","realLeads","realLeadDatabase"
   ];
-  for (const k of preferred) {
-    const t = db?.[k];
-    if (t && (typeof t.list === "function" || typeof t.update === "function" || typeof t.upsert === "function"))
-      return k;
-  }
-  return (
-    keys.find(k => {
-      if (/campaign/i.test(k)) return false;
-      if (!/lead|contact|prospect|people|person|record/i.test(k)) return false;
-      const t = db?.[k];
-      return typeof t?.list === "function" || typeof t?.update === "function" || typeof t?.upsert === "function";
-    }) ?? null
-  );
+  for (const k of preferred) if (db?.[k]) return k;
+  return names.find(k => /lead|contact|prospect|people|record/i.test(k)) ?? null;
 }
 
-function normOne(r: RawRow): NormLead {
-  // accept many header synonyms
-  const get = (...names: string[]) => {
-    for (const n of names) {
-      const v = r[n] ?? r[n.toLowerCase()];
-      if (v !== undefined) return v;
-    }
-    return null;
-  };
-
-  const email = (get("email","contactEmail","workEmail","businessEmail") || null)?.toString() || null;
-  const id =
-    (get("id") as string) ||
-    (email as string) ||
-    null;
-
-  const name =
-    (get("name","fullName","full_name","contact","contactName") as string) ||
-    (([get("firstName","firstname"), get("lastName","lastname")].filter(Boolean) as string[]).join(" ") || null);
-
-  return {
-    id,
-    company: (get("company","companyName","org","business") as string) || null,
-    name: name || null,
-    email,
-    industry: (get("industry","vertical") as string) || null,
-    size: (get("size","companySize","employees") as any) ?? null,
-    revenue: (get("revenue","annualRevenue") as any) ?? null,
-    location: (get("location","city","region","state","country") as string) || null,
-    score: Number(get("score","fit") as any) || null,
-    raw: r,
-  };
+// Limit concurrency
+async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T, i: number) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length) as any;
+  let idx = 0, active = 0;
+  return await new Promise<R[]>((resolve) => {
+    const pump = () => {
+      while (active < limit && idx < items.length) {
+        const i = idx++;
+        active++;
+        fn(items[i], i)
+          .then(v => out[i] = v)
+          .finally(() => { active--; (idx >= items.length && active === 0) ? resolve(out) : pump(); });
+      }
+    };
+    pump();
+  });
 }
 
+// --------------------------------- handler ---------------------------------
 export const handler: Handler = async (event) => {
-  if (event.httpMethod === "GET") {
-    // quick diagnostics / docs
-    return send(200, { ok: true, usage: "POST CSV (text/csv) or JSON { rows:[...] } to /api/leads-import" });
+  if (event.httpMethod !== "POST" && event.httpMethod !== "OPTIONS") {
+    return send(405, { error: "Method not allowed" });
   }
-  if (event.httpMethod !== "POST") return send(405, { error: "Method not allowed" });
+  if (event.httpMethod === "OPTIONS") {
+    return {
+      statusCode: 204,
+      headers: {
+        ...JSON_HEADERS,
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      },
+      body: "",
+    };
+  }
 
   const blink = await getBlink();
-  const db: any = blink?.db;
+  const db: any = (blink as any)?.db;
   if (!db) return send(200, { ok: false, reason: "db-unavailable" });
 
-  const leadsKey = findLeadsTableKey(db);
+  const leadsKey = findLeadsKey(db);
   if (!leadsKey) return send(200, { ok: false, reason: "no-leads-table" });
+  const t = db[leadsKey];
 
-  const ctype = String(event.headers["content-type"] || event.headers["Content-Type"] || "").toLowerCase();
-  let rows: RawRow[] = [];
-
+  // detect KV vs relational by sampling list()
+  let isKV = false;
   try {
-    if (ctype.includes("application/json")) {
-      const body = JSON.parse(event.body || "{}");
-      rows = Array.isArray(body?.rows) ? body.rows : [];
+    const sample = await (t?.list?.({ limit: 1 }) ?? null);
+    const arr   = sample?.items || sample?.rows || sample;
+    const first = Array.isArray(arr) ? arr[0] : null;
+    isKV = !!(first && ("key" in first || "value" in first));
+  } catch {}
+
+  // accept JSON array OR CSV text
+  const ctype = String(event.headers["content-type"] || event.headers["Content-Type"] || "");
+  let records: Array<Record<string, string>> = [];
+  try {
+    if (/application\/json/i.test(ctype)) {
+      const parsed = JSON.parse(event.body || "[]");
+      records = Array.isArray(parsed) ? parsed : [];
     } else {
-      // treat everything else as CSV (text/csv, text/plain)
       const text = event.body || "";
-      rows = parseCsv(text);
+      records = parseCsv(text);
     }
-  } catch (e: any) {
-    return send(400, { ok: false, reason: "parse-failed", message: String(e?.message || e) });
+  } catch (e) {
+    return send(400, { ok: false, error: "parse-failed", message: String(e) });
   }
 
-  // normalize
-  const normalized = rows.map(normOne).map(r => ({ ...r, id: r.id || rid() }));
+  if (!records.length) return send(200, { ok: true, inserted: 0, skipped: 0, failed: 0, table: leadsKey });
 
-  const tbl: any = db[leadsKey];
+  const toUpsert = records.map(normalizeRow).filter(x => x.id || x.key);
   let inserted = 0, skipped = 0, failed = 0;
-  const errors: { id: string; message: string }[] = [];
+  const firstErrors: string[] = [];
 
-  // Process in small batches to avoid timeouts
-  for (const group of chunk(normalized, 25)) {
-    const results = await Promise.allSettled(
-      group.map(async (rec) => {
-        const patch: any = {
-          company: rec.company ?? undefined,
-          name: rec.name ?? undefined,
-          email: rec.email ?? undefined,
-          industry: rec.industry ?? undefined,
-          size: rec.size ?? undefined,
-          revenue: rec.revenue ?? undefined,
-          location: rec.location ?? undefined,
-          score: rec.score ?? undefined,
-        };
-
-        // prefer upsert; fallback to create/patch patterns
-        if (typeof tbl.upsert === "function") {
-          await tbl.upsert({ where: { id: rec.id }, update: patch, create: { id: rec.id, ...patch } });
-        } else if (typeof tbl.update === "function") {
-          try {
-            await tbl.update(rec.id, patch);
-          } catch {
-            if (typeof tbl.create === "function") await tbl.create({ id: rec.id, ...patch });
-            else throw new Error("No upsert/update/create available");
-          }
-        } else if (typeof tbl.create === "function") {
-          await tbl.create({ id: rec.id, ...patch });
-        } else {
-          throw new Error("No write method on leads table");
-        }
-      })
-    );
-
-    for (const [i, res] of results.entries()) {
-      const id = group[i].id || "(unknown)";
-      if (res.status === "fulfilled") inserted++;
-      else {
-        failed++;
-        errors.push({ id, message: String((res as any).reason?.message || res) });
-      }
+  await mapLimit(toUpsert, 6, async (r) => {
+    const id = r.id!;
+    try {
+      const res = isKV
+        ? await writeKV(t, r.key!, r.value)
+        : await writeRelational(t, id, r.value);
+      if (res === "ok") inserted++;
+      else if (res === "dup") skipped++;
+      else { failed++; }
+    } catch (e: any) {
+      if (isDup(e)) skipped++;
+      else { failed++; firstErrors.length < 3 && firstErrors.push(String(e?.message ?? e)); }
     }
-  }
+  });
 
-  return send(200, { ok: true, table: leadsKey, inserted, failed, skipped, total: normalized.length, errors });
+  return send(200, {
+    ok: true,
+    table: leadsKey,
+    isKV,
+    inserted, skipped, failed,
+    firstErrors,
+  });
 };
