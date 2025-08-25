@@ -52,6 +52,13 @@
   status = 200
   force  = true
 
+# Force /api/leads-import to the Netlify function
+[[redirects]]
+  from   = "/api/leads-import"
+  to     = "/.netlify/functions/leads-import"
+  status = 200
+  force  = true
+
 # Generic /api/* → functions
 [[redirects]]
   from   = "/api/*"
