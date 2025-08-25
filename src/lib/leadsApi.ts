@@ -1,7 +1,7 @@
 // src/lib/leadsApi.ts
-// Unified client for Leads. It first tries your Netlify function (/api/leads)
-// and falls back to any existing SPA endpoint that returns { store:'leads', items:[...] }.
-// It also NORMALIZES fields so the grid no longer shows "Unknown".
+// Unified client for Leads. Prefer the Netlify Function (/.netlify/functions/leads)
+// and fall back to any existing SPA endpoint that returns { store:'leads', items:[...] }.
+// Always NORMALIZES fields so the grid no longer shows "Unknown".
 
 export type NormalizedLead = {
   id: string | null;
@@ -16,31 +16,74 @@ export type NormalizedLead = {
   raw: any;
 };
 
-type NetlifyFnShape = { ok?: boolean; rows?: any[]; table?: string | null };
+type FnShape = { ok?: boolean; rows?: any[]; table?: string | null };
 type StoreShape = { store?: string; items?: any[]; cursor?: any; counters?: any };
 
-const pick = (obj: any, keys: string[]) => {
-  for (const k of keys) if (obj && obj[k] != null) return obj[k];
+const first = (obj: any, keys: string[]) => {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && v !== "") return v;
+  }
   return null;
 };
 
-const normalize = (r: any): NormalizedLead => ({
-  id: pick(r, ["id", "key", "_id", "uuid"]),
-  company: pick(r, ["company", "companyName", "org", "business", "organization", "employer"]),
-  name: pick(r, ["name", "fullName", "full_name", "contact", "person"]),
-  email: pick(r, ["email", "workEmail", "businessEmail", "work_email", "business_email"]),
-  industry: pick(r, ["industry", "vertical", "sector"]),
-  size: pick(r, ["size", "companySize", "employees", "employeeCount"]),
-  revenue: pick(r, ["revenue", "annualRevenue", "arr", "yrRevenue"]),
-  location: pick(r, ["location", "city", "region", "state", "country"]),
-  score: Number(pick(r, ["score", "fit", "leadScore"])) || 0,
-  raw: r,
-});
+const buildName = (r: any) => {
+  const direct =
+    first(r, ["name", "fullName", "full_name", "contact", "person"]) ?? null;
+  if (direct) return String(direct);
+
+  const fn = first(r, ["firstName", "first_name"]);
+  const ln = first(r, ["lastName", "last_name"]);
+  const joined = [fn, ln].filter(Boolean).join(" ");
+  return joined || null;
+};
+
+const normalize = (row: any): NormalizedLead => {
+  // KV shape is often { key, value: {...} }; unwrap if present
+  const r = row?.value && typeof row.value === "object" ? row.value : row;
+
+  const id =
+    first(row, ["id", "key", "_id", "uuid"]) ??
+    first(r, ["id", "key", "_id", "uuid"]);
+
+  const email =
+    first(r, [
+      "email",
+      "contactEmail",
+      "workEmail",
+      "businessEmail",
+      "work_email",
+      "business_email",
+    ]) ?? null;
+
+  return {
+    id: id ?? null,
+    company:
+      first(r, [
+        "company",
+        "companyName",
+        "org",
+        "organization",
+        "business",
+        "employer",
+      ]) ?? null,
+    name: buildName(r),
+    email,
+    industry: first(r, ["industry", "vertical", "sector"]) ?? null,
+    size:
+      first(r, ["size", "companySize", "employees", "employeeCount"]) ?? null,
+    revenue:
+      first(r, ["revenue", "annualRevenue", "arr", "yrRevenue"]) ?? null,
+    location:
+      first(r, ["location", "city", "region", "state", "country"]) ?? null,
+    score: Number(first(r, ["score", "fit", "leadScore"])) || 0,
+    raw: row,
+  };
+};
 
 async function getJSON(url: string): Promise<any | null> {
   try {
     const res = await fetch(url, { credentials: "include" });
-    // In dev 404s return HTML; guard JSON parsing.
     const ct = res.headers.get("content-type") || "";
     if (!ct.includes("application/json")) return null;
     return await res.json();
@@ -51,22 +94,31 @@ async function getJSON(url: string): Promise<any | null> {
 
 /**
  * Fetch leads and always return a normalized array the table can render.
- * Tries serverless first (redirected to /.netlify/functions/leads by netlify.toml),
- * then falls back to any existing SPA data source that returns { store:'leads', items:[...] }.
+ * Order of preference:
+ *   1) Netlify Function (explicit path) → /.netlify/functions/leads
+ *   2) SPA/KV fallback → /api/leads returning { store:'leads', items:[...] }
  */
-export async function getLeadsNormalized(limit = 50): Promise<NormalizedLead[]> {
-  // 1) Netlify function path (your redirects map /api/* -> functions)
-  const fnData = (await getJSON(`/api/leads?limit=${encodeURIComponent(limit)}`)) as NetlifyFnShape | null;
+export async function getLeadsNormalized(
+  limit = 50
+): Promise<NormalizedLead[]> {
+  const q = `limit=${encodeURIComponent(limit)}`;
+
+  // 1) Netlify Function (explicit path to avoid SPA intercepts)
+  const fnData = (await getJSON(
+    `/.netlify/functions/leads?${q}`
+  )) as FnShape | null;
   if (fnData && Array.isArray(fnData.rows)) {
     return fnData.rows.map(normalize);
   }
 
-  // 2) Fallback: any SPA "store" response you already return in app (e.g. {store:'leads', items:[...]})
-  const spaData = (await getJSON(`/api/leads?limit=${encodeURIComponent(limit)}`)) as StoreShape | null;
+  // 2) Fallback to SPA/KV store
+  const spaData = (await getJSON(`/api/leads?${q}`)) as StoreShape | null;
   if (spaData && Array.isArray(spaData.items)) {
     return spaData.items.map(normalize);
   }
 
-  // 3) Nothing usable
   return [];
 }
+
+// Optional alias some callers might prefer
+export const fetchLeads = getLeadsNormalized;
